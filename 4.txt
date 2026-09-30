@@ -1,0 +1,2161 @@
+/* ============ 属性加点 ============ */
+function buy(k, delta){
+  const a = ATTRS.find(x => x.k === k);
+  const cur = S[k + 'Lv'];
+  if(delta > 0){
+    let bought = 0, paid = D(0);
+    const room = isFinite(a.max) ? Math.max(0, a.max - cur) : Infinity;
+    /* 上限文案：a.max 是「等级上限」（spd / combo 为 100 级），不是百分比。
+       原把两者混为一谈、统一写成百分比，给攻速 / 连击率弹出「已达上限（百分比）」，语义错误。 */
+    if(room <= 0){ toast(a.name + '已达上限 Lv.' + a.max); render(); return; }
+    if(delta > 50000){                                   /* 大批量：闭式二分，一次算完 */
+      bought = maxAfford(a, cur, Math.min(delta, isFinite(room) ? room : 1e15));
+      paid = costFor(a, cur, bought);
+      if(bought === 0) toast('转生币不足');
+    }else{
+      /* 与大批量的闭式结果对齐：先按闭式算出在预算内可买的最大级数，
+         原逐次累加因「小值取整」规则不同，与闭式在相近次数上会有微小差额。 */
+      const _cap = Math.min(delta, isFinite(room) ? room : 1e15);
+      bought = maxAfford(a, cur, _cap);
+      paid = bought > 0 ? costFor(a, cur, bought) : D(0);
+      if(bought === 0){
+        const c = aCost(a, cur);
+        toast(dcmp(c, S.pts || D(0)) > 0 ? ('转生币不足（还需 ' + dStr(c) + '）') : (a.name + '已达上限 Lv.' + a.max));
+      }
+    }
+    if(bought > 0){
+      S[k + 'Lv'] += bought;
+      S.pts = dadd(S.pts || D(0), dNeg(paid));
+      if(dcmp(S.pts || D(0), D(0)) < 0) S.pts = D(0);     /* 闭式与逐次取整的微小误差兜底 */
+      if(k === 'spd') startAuto();
+    }
+  }else{
+    if(cur <= 0){ toast('当前等级为 0（可用「重置」清零）'); return; }
+    const refund = aCost(a, cur - 1);
+    S[k + 'Lv'] = cur - 1; S.pts = dadd(S.pts || D(0), refund);
+    if(k === 'spd') startAuto();
+    toast('已降级，返还 ' + dStr(refund) + ' 转生币');
+  }
+  render(); save();                                      /* 加点/降级立即落盘（原遗漏，与 resetOne 不一致） */
+}
+
+/* 连买 n 级总价（闭式）：Σ base*(1+0.5i), i = cur .. cur+n-1 */
+function costFor(a, cur, n){
+  if(!(n > 0)) return D(0);
+  const N = D(n);
+  return dadd(dmul(D(a.base), N),
+    dmul(D(0.25 * a.base), dmul(N, dadd(dmul(D(2), D(cur)), dadd(N, D(-1))))));
+}
+/* 二分求在 cap 内最多能买多少级（大点数时避免百万次循环） */
+function maxAfford(a, cur, cap){
+  const pts = S.pts || D(0);
+  if(!isFinite(cap) || !(cap > 0) || dcmp(costFor(a, cur, 1), pts) > 0) return 0;
+  let lo = 1, hi = Math.min(Math.floor(cap), 1e12);      /* 防御 Infinity：调用处已兜底，此处再加一层保险 */
+  if(dcmp(costFor(a, cur, hi), pts) <= 0) return hi;
+  while(lo < hi){
+    const mid = Math.floor((lo + hi + 1) / 2);
+    if(dcmp(costFor(a, cur, mid), pts) <= 0) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+function refundFor(a, lv){
+  if(lv > 200000){                                  /* 大等级闭式：Σ base*(1+0.5i) */
+    const n = D(lv);
+    return dmul(D(a.base), dadd(n, dmul(D(0.25), dmul(n, D(lv - 1)))));
+  }
+  let r = D(0);
+  for(let i = 0; i < lv; i++) r = dadd(r, aCost(a, i));
+  return r;
+}
+function resetOne(k){
+  const a = ATTRS.find(x => x.k === k);
+  if(!a) return;
+  const lv = S[k + 'Lv'];
+  if(!lv){ toast(a.name + '当前等级为 0'); return; }
+  const refund = refundFor(a, lv);
+  S[k + 'Lv'] = 0;
+  S.pts = dadd(S.pts || D(0), refund);
+  if(k === 'spd') startAuto();
+  toast(a.name + '已重置，返还 ' + dStr(refund) + ' 转生币');
+  render(); save();
+}
+function resetAttrs(){
+  let refund = D(0);
+  for(const a of ATTRS){
+    refund = dadd(refund, refundFor(a, S[a.k + 'Lv']));
+    S[a.k + 'Lv'] = 0;
+  }
+  S.pts = dadd(S.pts || D(0), refund);
+  startAuto();
+  toast('属性已重置，返还 ' + dStr(refund) + ' 转生币');
+  render(); save();                                      /* 一键重置立即落盘（原遗漏） */
+}
+
+/* ============ 视图/标签 ============ */
+function switchView(v){
+  document.querySelectorAll('.bn-item').forEach(t => t.classList.toggle('active', t.dataset.view === v));
+  $('view-attrs').classList.toggle('show', v === 'attrs');
+}
+function switchTab(key){
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === key));
+  const pn = $('pane-normal'); if(pn) pn.style.display = key === 'normal' ? '' : 'none';
+}
+function closeDetail(){ $('detailOverlay').classList.remove('show'); }
+
+let toastTimer;
+function toast(t){
+  const el = $('toast');
+  el.textContent = t; el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+}
+
+/* ============ 兑换码（2.21） ============
+   纯本地校验：码表写死在客户端，输入后与表比对，命中即发奖并记录到 S.cdkUsed（入档），
+   同一存档内每个码只能领一次。不联网，故不校验账号 / 有效期。 */
+const CDK_TABLE = {
+  'XTBOX10000': { name:'万箱礼包', box:10000 }      /* 万箱礼包：凡尘宝箱 ×10000 */
+};
+function redeemCDK(){
+  const el = $('cdkInput'); if(!el) return;
+  const tip = $('cdkTip');
+  const code = (el.value || '').trim().toUpperCase().replace(/\s+/g, '');
+  if(!code){ toast('请先输入兑换码'); return; }
+  if(!S.cdkUsed || typeof S.cdkUsed !== 'object') S.cdkUsed = {};
+  if(S.cdkUsed[code]){
+    toast('该兑换码已使用过');
+    if(tip) tip.textContent = '「' + code + '」已使用过，每个兑换码仅可使用一次。';
+    return;
+  }
+  const g = CDK_TABLE[code];
+  if(!g){
+    toast('兑换码无效');
+    if(tip) tip.textContent = '兑换码无效，请检查是否输入正确。';
+    return;
+  }
+  let parts = [];
+  if(g.box){ resAdd('box', g.box); parts.push('凡尘宝箱 +' + nStr(g.box)); }
+  if(g.gem){ resAdd('gem', g.gem); parts.push('宝石 +' + nStr(g.gem)); }
+  if(!parts.length){ toast('该兑换码暂无可领内容'); return; }
+  S.cdkUsed[code] = 1;
+  el.value = '';
+  const txt = '已领取「' + g.name + '」：' + parts.join('　');
+  if(tip) tip.textContent = txt + '　（当前凡尘宝箱 ' + dStr(dFloor(resD('box'))) + '）';
+  toast(txt);
+  save(); render();
+}
+
+/* ============ 设置系统（秘境节奏 / 飘字 / 存档） ============ */function openSettings(){ renderSettings(); $('settingsOverlay').classList.add('show'); }
+function closeSettings(){ $('settingsOverlay').classList.remove('show'); }
+function renderSettings(){
+  document.querySelectorAll('.set-fps').forEach(function(b){ b.classList.toggle('active', +b.dataset.v === (S.fps||60)); });
+
+  $('setDmg').textContent = (S.showDmg !== false) ? '开（点击关闭）' : '关（点击开启）';
+  var _sd = $('setSimpleDmg');
+  if(_sd) _sd.textContent = (S.simpleDmg === true) ? '开（点击关闭）' : '关（点击开启）';
+  $('setSci').textContent = S.sci ? '科学计数法（点击切换）' : '单位后缀（点击切换）';
+  var _sb = $('sndBgm');
+  if(_sb){ _sb.textContent = '背景音乐：' + (bgmOn() ? '开' : '关'); _sb.classList.toggle('active', bgmOn()); }
+  $('setInfo').textContent = '关卡 ' + S.level + ' · 转生 ' + S.rebirth + ' · 修炼 ' + S.cultDone + '/20 · 秘境第 ' + S.secretStage + ' 关';
+  if($('setVer')) $('setVer').textContent = GAME_VER;
+  renderPickFilter();
+  if(DEV_MODE){
+    const _df = $('devFab'); if(_df) _df.style.display = 'block';
+/* 设置面板内的显式入口：悬浮 DEV 按钮在部分机型会被安全区 / 浏览器工具栏遮挡，
+       这里再给一条稳定的打开路径（同样只在测试版出现）。 */
+    let _db = $('setDevBtn');
+    if(!_db){
+      const _sec = document.createElement('div');
+      _sec.className = 'set-sec'; _sec.textContent = '开发者调试';
+      const _row = document.createElement('div');
+      _row.className = 'set-btns';
+      _db = document.createElement('button');
+      _db.id = 'setDevBtn'; _db.textContent = '打开开发者面板';
+      _db.onclick = function(){ closeSettings(); openDev(); };
+      _row.appendChild(_db);
+      const _ta = $('setTa');
+      if(_ta && _ta.parentNode) _ta.parentNode.insertBefore(_sec, _ta), _ta.parentNode.insertBefore(_row, _ta);
+    }
+  }
+  /* 显示当日存档下载 / 上传剩余次数 */
+  const q = $('setQuota');
+  if(q) q.textContent = '今日存档：下载 ' + dlLeft() + '/' + SAVE_DL_LIMIT + ' 次 · 上传 ' + ulLeft() + '/' + SAVE_UL_LIMIT + ' 次';
+
+}
+
+/* 灵界拾取过滤（1.46 改为横版折叠）：
+   两组各占一条横栏，点击标题展开 / 收起；展开后选项横向排列（flex-wrap），
+   相比原来的「两组各竖排 6 个按钮」更省竖向空间 —— 设置面板内容已经很长。
+   折叠状态存 S.pickOpen（{arti:bool, rune:bool}），重开设置面板时保持。 */
+function renderPickFilter(){
+  const box = $('setPickWrap'); if(!box) return;
+  if(!S.pickOpen || typeof S.pickOpen !== 'object') S.pickOpen = {};
+  const opts = [['全部保留', -1]].concat(RUNE_Q.map(function(n, i){ return [n + '以下自动分解', i]; }));
+  let h = '';
+  [['arti', '法 宝'], ['rune', '符 文']].forEach(function(row){
+    const kind = row[0];
+    const open = !!S.pickOpen[kind];
+    const cur = opts.filter(function(o){ return o[1] === pickAutoQ(kind); })[0] || opts[0];
+    h += '<div class="pk-row' + (open ? ' open' : '') + '">'
+      +  '<div class="pk-hd" onclick="togglePick(\'' + kind + '\')">'
+      +    '<span class="pk-ar">' + (open ? '▾' : '▸') + '</span>'
+      +    '<span class="pk-tt">' + row[1] + '</span>'
+      +    '<span class="pk-cv">' + cur[0] + '</span>'
+      +  '</div>';
+    if(open){
+      h += '<div class="pk-bd">';
+      opts.forEach(function(o){
+        const on = (pickAutoQ(kind) === o[1]);
+        h += '<button class="pk-btn' + (on ? ' active' : '') + '" onclick="setPickQ(\'' + kind + '\',' + o[1] + ')">' + o[0] + '</button>';
+      });
+      h += '</div>';
+    }
+    h += '</div>';
+  });
+  box.innerHTML = h;
+}
+function togglePick(kind){
+  if(!S.pickOpen || typeof S.pickOpen !== 'object') S.pickOpen = {};
+  S.pickOpen[kind] = !S.pickOpen[kind];
+  renderPickFilter(); save();
+}
+function setPickQ(kind, v){
+  if(kind === 'arti') S.setArtiQ = v; else S.setRuneQ = v;
+  renderPickFilter(); save();
+}
+function setFps(v){
+  /* 说明：主线攻击间隔由 calcAps() 决定（16ms 兜底），不设帧率地板，故 fps 仅作用于秘境 tick 间隔。
+     原 toast 文案「省电 30 / 标准 60 / 极致 120」易被误解为全局帧率上限，已改为说明真实影响。 */
+  S.fps = v; startAuto(); if(S.inSecret) startSecret();
+  renderSettings(); save(); toast('秘境节奏：' + (v===30?'省电（500ms）':(v===120?'极速（160ms）':'标准（320ms）')) + '（仅作用于秘境）');
+}
+function toggleDmg(){
+  S.showDmg = (S.showDmg === false);
+  renderSettings(); save(); toast('伤害飘字已' + (S.showDmg !== false ? '开启' : '关闭'));
+}
+function toggleSimpleDmg(){
+  S.simpleDmg = (S.simpleDmg !== true);
+  renderSettings(); save();
+  toast('简化跳字已' + (S.simpleDmg ? '开启（只显示数字）' : '关闭'));
+}
+function toggleSci(){
+  S.sci = !S.sci;
+  renderSettings(); render(); save();
+  toast('数字显示已切换为' + (S.sci ? '科学计数法' : '单位后缀'));
+}
+/* 存档下载 / 上传：每天各 3 次（用于防止频繁倒腾存档） */
+const SAVE_DL_LIMIT = 3, SAVE_UL_LIMIT = 3;
+function dlLeft(){
+  const d = today();
+  if(S.expDay !== d){ S.expDay = d; S.expCnt = 0; }
+  return Math.max(0, SAVE_DL_LIMIT - (S.expCnt || 0));
+}
+function ulLeft(){
+  const d = today();
+  if(S.impDay !== d){ S.impDay = d; S.impCnt = 0; }
+  return Math.max(0, SAVE_UL_LIMIT - (S.impCnt || 0));
+}
+function exportSave(){
+  if(dlLeft() <= 0){ toast('今日下载次数已用完（每天 ' + SAVE_DL_LIMIT + ' 次）'); return; }
+  const d0 = today();
+  if(S.expDay !== d0){ S.expDay = d0; S.expCnt = 0; }
+  S.expCnt = (S.expCnt || 0) + 1;
+  save();                                   /* 立即落盘：原只改内存，导出后立刻刷新/关页会丢失计数，等于绕过每日 3 次 */
+  try{
+    const data = localStorage.getItem('xiantu_save') || '{}';
+    const code = 'XT1.' + btoa(unescape(encodeURIComponent(data)));
+    const ta = $('setTa'); ta.value = code; ta.focus(); ta.select();
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(code).then(function(){ toast('存档码已复制到剪贴板'); }, function(){ toast('请长按文本框全选复制'); });
+    } else { toast('请长按文本框全选复制'); }
+  }catch(e){ toast('导出失败'); }
+}
+function importSave(){
+  const v = ($('setTa').value || '').trim();
+  if(!v){ toast('请先粘贴存档码'); return; }
+  /* 长度上限：粘贴超长文本会让 atob / JSON.parse 长时间阻塞主线程，页面直接卡死 */
+  if(v.length > SAVE_TA_MAX){ toast('存档码过长，请确认粘贴内容'); return; }
+  if(ulLeft() <= 0){ toast('今日上传次数已用完（每天 ' + SAVE_UL_LIMIT + ' 次）'); return; }
+  const d0 = today();
+  if(S.impDay !== d0){ S.impDay = d0; S.impCnt = 0; }
+  S.impCnt = (S.impCnt || 0) + 1;
+  try{
+    let raw = v.indexOf('XT1.') === 0 ? decodeURIComponent(escape(atob(v.slice(4)))) : v;
+    const o = JSON.parse(raw);
+    if(typeof o !== 'object' || o === null || o.level === undefined) throw 0;
+    /* 次数以本地为准写入被导入档：原直接整包覆盖，导入旧档即可把次数刷回 0，等于绕过限制 */
+    o.impDay = S.impDay; o.impCnt = S.impCnt;
+    o.expDay = S.expDay; o.expCnt = S.expCnt || 0;
+    /* 改写次数后必须重新签名并同步备份快照：
+       签名覆盖存档全部字段（含 _bak 自身）。若只改值不重签，load() 会判定「签名不符 = 篡改」，
+       随后用 _bak 把次数回滚成「导出时的旧值」 —— 结果是导入不计次，可反复导入绕过每日 3 次限制
+       （1.22 声称修过，但被签名回滚抵消，实际一直可绕过）。 */
+    try{
+      if(o._bak && typeof o._bak === 'object'){
+        ['impDay','impCnt','expDay','expCnt'].forEach(function(k){ o._bak[k] = o[k]; });
+      }
+      o._sig = sigOf(o);
+    }catch(_e){}
+    localStorage.setItem('xiantu_save', JSON.stringify(o, bigRepl));
+    toast('导入成功，即将刷新'); setTimeout(function(){ location.reload(); }, 800);
+  }catch(e){ toast('存档码无效'); }
+}
+let _delArm = false;
+/* _wiped：清空后置位，彻底阻止刷新前的 800ms 内被自动存档 / 战斗存档写回（原会复活存档导致删档无效） */
+let _wiped = false;
+function wipeSave(){
+  const b = $('setWipe');
+  if(!_delArm){ _delArm = true; b.textContent = '再点一次确认清空！'; setTimeout(function(){ _delArm = false; if(b) b.textContent = '清空存档'; }, 2500); return; }
+  _delArm = false; if(b) b.textContent = '清空存档';
+  _wiped = true;
+  if(saveTimer) clearInterval(saveTimer);
+  if(autoTimer) clearInterval(autoTimer);                 /* 同时停掉战斗，避免击杀等逻辑间接触发存档 */
+  /* 自动点击系统已移除，无需清理 acTimer */
+  /* 注：原用 typeof x !== 'undefined' 做保护。x 是 let 声明的，TDZ 内 typeof 反而会抛
+     ReferenceError —— 此处之所以没崩只是因为 wipeSave 必在用户点击后才执行（let 早已初始化）。
+     直接引用更诚实也更简单。 */
+  if(secretTimer) clearInterval(secretTimer);
+  if(lmgMonTimer) clearInterval(lmgMonTimer);            /* 灵界妖魔反击 */
+  lmgMonTimer = null; secretTimer = null;
+  /* 监听器：window 上注册的是具名 save，document 上是具名 _onVisChange，两处都能真正移除 */
+  document.removeEventListener('visibilitychange', _onVisChange);
+  localStorage.removeItem('xiantu_save');
+  toast('存档已清空，即将刷新'); setTimeout(function(){ location.reload(); }, 800);
+}
+
+
+/* ============ 无限塔系统 ============ */
+const TOWERS = [
+  {k:'fr', n:'凡人塔'}, {k:'sb', n:'神兵塔'}
+];
+let twCur='fr', twPage=0, twTabsBuilt=false;
+function towerName(t){ return (t||S.towerType||'fr')==='sb' ? '神兵塔' : '凡人塔'; }
+function towerMaxHpFor(f, t){                                   /* 凡人塔陡峭 / 神兵塔平缓（无限层） */
+  if((t||'fr')==='sb') return dmul(D(600), dpow(D(1.12), f-1));
+  return dmul(D(200), dpow(D(1.285), f-1));
+}
+/* 凡人塔奖励大幅加强：原为纯多项式 (10f + f²/2)，而血量是 1.285^f 的指数增长，
+   高层奖励相对血量几乎可以忽略，爬塔收益完全不划算。
+   现叠加指数项 1.025^(f-1)：第 100 层约 ×11、第 300 层约 ×1400、第 1000 层约 ×1.6e10。
+   用 dpow（对数法，O(1)）直接算，层数极大也不会溢出为 Infinity。 */
+/* ---- 1.56 双塔掉落加成（两塔 keys 完全分开，互不通用）----
+   凡人塔 twpts：转生点百分比；神兵塔 sbpts：碎片数量百分比。
+   目标总倍率 ≈ 50 倍（不含香火·塔神，香火另计），分配：
+     成就 300% + 宝物 2300%（800/1500）+ 功法 1300%（400/900）+ 称号 1000% = 4900% ≈ 50x */
+function frTowerPct(){                                  /* 凡人塔转生点加成 %（含成就 + 香火·塔神） */
+  return achFrPts() + treSum('twpts') + gfSum('twpts') + titleSum('twpts');
+}
+function achSbPts(){ return 30 * achSt('sbF') + incensePct('tower'); }   /* 神兵塔：香火·塔神同样生效 */
+function sbTowerPct(){                                  /* 神兵塔碎片加成 %（含成就 + 香火·塔神） */
+  return achSbPts() + treSum('sbpts') + gfSum('sbpts') + titleSum('sbpts');
+}
+function towerPtsFor(f){
+  if(!(f > 0)) return D(0);
+  const poly = D(10*f + f*f/2);
+  const grow = (f > 1) ? dpow(D(1.025), f - 1) : D(1);
+  return dmul(dmul(poly, grow), D(1 + frTowerPct()/100));
+}
+/* 神兵塔碎片加强：原 1 + f/5（第 100 层仅 21 枚），现追加二次项 f²/100，
+   第 100 层 121 枚、第 300 层 961 枚、第 500 层 2601 枚。 */
+function sbDropNum(f){
+  const base = 1 + Math.floor(f/5) + Math.floor(f*f/100);
+  return Math.floor(base * (1 + sbTowerPct()/100)) + achSbDrop();   /* 百分比先乘后取整，整数特殊奖励最后加 */
+}
+function sbDrop(f){
+  const n = sbDropNum(f), r = Math.random()*100;
+  if(r < 10) return {key:'shardS', nm:'绝世', n:n};              /* 10% 绝世 */
+  if(r < 40) return {key:'shardL', nm:'利器', n:n};              /* 30% 利器 */
+  return {key:'shardT', nm:'凡铁', n:n};                         /* 60% 凡铁 */
+}
+function sbResetAvail(){ return S.sbResetDay !== today(); }   /* 与 expDay/impDay/qd 统一用 YYYY-M-D，避免 toDateString() 随系统语言变化 */
+function sbReset(){
+  if(!sbResetAvail()){ toast('今日已重置，明日再来'); return; }
+  if(S.inTower && S.towerType==='sb') exitTower();
+  S.sbDone = 0;
+  S.sbResetDay = today();
+  toast('神兵塔进度已重置'); logMsg('进度重置（每日一次）');
+  renderTowers(); save();
+}
+/* 凡人塔每日重置：与神兵塔同款，每天一次。
+   凡人塔是无限层且奖励随层数指数增长（towerPtsFor 含 1.025^(f-1) 项），
+   重置后从第 1 层重打意味着短期收益下降，它的用途是：
+   变强后想把「低层速通」的转生点再刷一遍，或换一种推层节奏重新体验。
+   只清 towerDone（挑战进度），stFrF（历史最高，称号条件用）保留 —— 已获得的称号不受影响。 */
+function frResetAvail(){ return S.frResetDay !== today(); }
+function frReset(){
+  if(!frResetAvail()){ toast('今日已重置，明日再来'); return; }
+  if(S.inTower && S.towerType==='fr') exitTower();
+  S.towerDone = 0;
+  S.towerFloor = 1;
+  S.towerHp = null; S.towerMaxHp = null;
+  S.frResetDay = today();
+  toast('凡人塔进度已重置'); logMsg('进度重置（每日一次，最高层保留）');
+  twPage = 0;
+  renderTowers(); save();
+}
+function openTowers(){
+  if(!twTabsBuilt){ buildTowerTabs(); twTabsBuilt=true; }
+  twCur = (S.inTower && S.towerType==='sb') ? 'sb' : 'fr';
+  twPage = Math.floor(Math.max(0,(S.towerDone||0))/15);
+  renderTowers(); $('towerOverlay').classList.add('show');
+}
+function closeTowers(){ $('towerOverlay').classList.remove('show'); }
+function buildTowerTabs(){
+  const box=$('twTabs'); box.innerHTML='';
+  TOWERS.forEach(function(t){
+    const b=document.createElement('div');
+    b.className='tw-tab'; b.dataset.k=t.k; b.textContent=t.n;
+    b.onclick=function(){ selTower(t.k); };
+    box.appendChild(b);
+  });
+}
+function selTower(k){ twCur=k; twPage=0; renderTowers(); }
+/* 无限层：总页数随已通关层数动态增长（原为写死的 1000 层 / 15），保证能翻到「下一层」所在页 */
+function twPageMax(){ return Math.max(0, Math.ceil(((S.towerDone||0)+1)/15) - 1); }
+function twGo(d){ twPage=Math.max(0,Math.min(twPageMax(),twPage+d)); renderTowers(); }
+function renderTowers(){
+  const st=$('twStatus');
+  if(st) st.textContent = S.inTower ? ('正在挑战：'+towerName()+' 第 '+S.towerFloor+' 层') : '当前没有进行中的挑战。';
+  document.querySelectorAll('.tw-tab').forEach(function(b){
+    b.classList.toggle('active', b.dataset.k===twCur);
+  });
+  const t=TOWERS.find(function(x){return x.k===twCur;}) || TOWERS[0];
+  const info=$('twInfo'), grid=$('twGrid'), pager=$('twPager');
+  if(t.k==='sb'){
+    pager.style.display='none';
+    const dn=S.sbDone||0, nx=dn+1;
+    info.innerHTML=
+      '<div class="tw-title">神兵塔最高通关：<b>'+dn+'</b> 层（无限层）</div>'+
+      '<div class="tw-desc">无限挑战，每层掉兵器碎片，越高层越多。</div>'+
+      '<div class="tw-next">下一层：第 '+nx+' 层，生命 '+dStr(towerMaxHpFor(nx,'sb'))+'，通关掉落 <b>'+sbDropNum(nx)+'</b> 枚碎片。</div>'+
+      '<button class="tw-challenge" onclick="challengeTower(\'sb\')">进入挑战</button> '+
+      (sbResetAvail()
+        ? '<button class="tw-challenge" style="background:linear-gradient(180deg,#8a6a3a,#5a4020);color:#f4e6c8;" onclick="sbReset()">重置进度</button>'
+        : '<span class="tw-desc" style="display:inline-block;margin-left:6px;">（今日已重置）</span>');
+    grid.innerHTML=
+      '<div class="tw-cell done"><div class="tw-f">凡铁碎片</div><div class="tw-d">掉落最多<br>用于凡铁品质兵器</div></div>'+
+      '<div class="tw-cell next"><div class="tw-f">利器碎片</div><div class="tw-d">掉落较少<br>用于利器品质兵器</div></div>'+
+      '<div class="tw-cell" style="border-color:#6a4a20;"><div class="tw-f" style="color:#ffb347;">绝世碎片</div><div class="tw-d">掉落最少<br>用于绝世 / 神品兵器</div></div>';
+    return;
+  }
+  pager.style.display='';
+  const done=S.towerDone||0, next=done+1;
+  info.innerHTML=
+    '<div class="tw-title">凡人塔最高通关：<b>'+done+'</b> 层（无限层）</div>'+
+    '<div class="tw-desc">每层给转生点，越高层越多。</div>'+
+    '<div class="tw-next">下一层：第 '+next+' 层，生命 '+dStr(towerMaxHpFor(next,'fr'))+'，通关奖励 <b>'+dStr(towerPtsFor(next))+'</b> 转生点。</div>'+
+    '<button class="tw-challenge" onclick="challengeTower(\'fr\')">挑战下一层</button> '+
+    (frResetAvail()
+      ? '<button class="tw-challenge" style="background:linear-gradient(180deg,#8a6a3a,#5a4020);color:#f4e6c8;" onclick="frReset()">重置进度</button>'
+      : '<span class="tw-desc" style="display:inline-block;margin-left:6px;">（今日已重置）</span>');
+  let h='';
+  const start=twPage*15+1;
+  for(let i=start;i<start+15;i++){                    /* 无限层：不再截断到 1000，未解锁层也展示血量/奖励供预览 */
+    const stt=i<=done?'done':(i===done+1?'next':'lock');
+    h+='<div class="tw-cell '+stt+'"><div class="tw-f">第'+i+'层</div><div class="tw-d">生命 '+dStr(towerMaxHpFor(i,'fr'))+'<br>奖励 '+dStr(towerPtsFor(i))+' 转生点</div></div>';
+  }
+  grid.innerHTML=h;
+  $('twPageTxt').textContent='第 '+(twPage+1)+' / '+(twPageMax()+1)+' 页';
+}
+function challengeTower(t){
+  t = t || 'fr';
+  closeTowers(); enterTower(t);
+}
+/* resetToMain() 名为「回到主线」，实际还负责：清毒层、清不死不休层数、重启 autoTimer。
+   耦合偏重 —— 新增模式（如灵界塔）时必须在此同步加分支，否则会重演「秘境中转生后攻击永久停止」。 */
+function enterTower(t){
+  t = t || 'fr';
+  exitLingToFr();                     /* 灵界与凡人界互斥：进塔前先返回凡人界，否则攻击会打到灵界怪物 */
+  cancelSecret();
+  if(S.inSecret){ exitSecret(); }
+  clearBossMode();                    /* 挑战无限塔时自动退出 BOSS 挑战（内部已清理标记并刷新 UI） */
+  S.towerType = t;
+  /* 1.55：起始层 = 已通关层 + 1 + 该塔专属的跳跃宝物加成（凡人塔 twfr / 神兵塔 twsb，互不通用） */
+  const _skip = treSum(t === 'sb' ? 'twsb' : 'twfr');
+  S.towerFloor = (t==='sb' ? ((S.sbDone||0)+1) : ((S.towerDone||0)+1)) + _skip;
+  S.towerMaxHp = towerMaxHpFor(S.towerFloor, t);
+  S.towerHp = S.towerMaxHp;
+  S.inTower = true;
+  S.poison = 0;
+  applyTowerUI();
+  renderTowerMode();
+  logMsg('挑战'+towerName(t)+'第 '+S.towerFloor+' 层！');
+  toast(towerName(t)+' 第 '+S.towerFloor+' 层');
+  save();
+}
+function exitTower(){
+  S.inTower=false; S.towerType='fr';
+  clearBossMode();                    /* 返回主线时自动退出 BOSS 挑战 */
+  applyTowerUI();
+  applySecretUI();
+  render();
+  logMsg('离开塔，返回主线');
+  toast('返回主线');
+  save();
+}
+function doTowerHit(manual){
+  hitInc();
+  const ty = S.towerType || 'fr';
+  if(!S.towerHp || dcmp(S.towerHp, D(0)) <= 0){ S.towerHp = S.towerMaxHp || towerMaxHpFor(S.towerFloor||1, ty); }
+    const _atk = calcAtk();                                /* 缓存攻击力（原每连击段重复计算，段数多时开销大） */
+  let sum = dmul(_atk, D(0.9 + Math.random() * 0.2));
+  let critN = 0, comboN = 0;
+  const crit = Math.random() * 100 < calcCrit();
+  if(crit){ sum = dmul(sum, D(critMult())); critN = 1 + critExtra();
+    }
+  sum = dadd(sum, dmul(_atk, D(calcIgn() / 100)));        /* 无视防御附加真伤（原三模式完全缺失） */
+  { const _cs = {n:0, hit:false};
+    sum = comboAdd(sum, _atk, 0.15, 0.9, 0.2, _cs);
+    if(_cs.hit) comboN += _cs.n; }
+  { const _pn = gfSum('psnhit');
+    if(_pn > 0 && S.poison > 0) sum = dadd(sum, dmul(dmul(D(S.poison), D(_pn)), D(psnMultSum()))); }
+  sum = dmul(sum, D(1 + tSum('nmult') / 100));            /* 猛攻之势 / 屠戮本能 */
+  sum = dmul(sum, D(1 + calcFdm() / 100));                /* 最终伤害乘区 */
+  if(ignAmpMul() > 1) sum = dmul(sum, D(ignAmpMul()));    /* 破界神锋 */
+  S.ndxStack += 1 + tSum('ndxplus');                      /* 不死不休叠层（原三模式完全不叠） */
+  sum = dmul(sum, D(1 + calcNdx() / 100));                /* 不死不休伤害加成 */
+if(manual) S.clicks++;
+  S.poison = Math.min(poisonCap(), S.poison + poisonAdd());   /* 自动/手动都叠毒层 */
+  S.totalDmg = dadd(S.totalDmg || D(0), sum);
+  S.towerHp = dadd(S.towerHp, dNeg(sum));
+  if(dcmp(S.towerHp, D(0)) < 0) S.towerHp = D(0);
+  let poison = D(0);
+  if(psnPerStack() > 0){ poison = calcPsnDmg(S.poison);
+    S.totalDmg = dadd(S.totalDmg || D(0), poison);
+    S.towerHp = dadd(S.towerHp, dNeg(poison));
+    if(dcmp(S.towerHp, D(0)) < 0) S.towerHp = D(0);
+  }
+  achHit(sum, crit, poison);                           /* 移出毒伤分支 */
+  /* 斩杀线天赋（原仅主线判定，塔中失效） */
+  const _line = tSum('line');
+  if(_line > 0 && dcmp(S.towerHp, dmul(S.towerMaxHp, D(_line / 100))) <= 0 && dcmp(S.towerHp, D(0)) > 0) S.towerHp = D(0);
+  if(dcmp(S.towerHp, D(0)) <= 0){ towerKill(); }
+  return {sum:sum, crit:crit, critN:critN, combo:comboN>0, comboN:comboN, poison:poison};
+}
+function towerKill(){
+  S.ndxStack = 0;                                    /* 击杀后清空不死不休层数（主线 killBoss 已清，此处补齐） */
+  resAdd('soul', soulGain());                            /* 灵魂：击杀 +1 */
+  const f = S.towerFloor;
+  if(S.towerType === 'sb'){
+    const d = sbDrop(f);
+    S[d.key] = (S[d.key]||0) + d.n;
+    questAdd('kill', 1);
+    { const _bn = frBoxDrop(BOX_DROP_TOWER); if(_bn > 0){ resAdd('box', _bn); questAdd('getbox', _bn); logMsg('神兵塔第 '+f+' 层掉落凡尘宝箱 ×'+_bn); } }
+    if(f > (S.sbDone||0)) S.sbDone = f;
+    if(f > (S.stSbF||0)) S.stSbF = f;
+    S.poison = 0;                                    /* 每层换怪，毒层从 0 重新叠 */
+    logMsg('神兵塔第 '+f+' 层通关！掉落'+d.nm+'碎片 ×'+d.n);
+    toast('第 '+f+' 层！'+d.nm+'碎片 +'+d.n);
+    /* 1.56：跃层宝物【每次击败都生效】——原仅进入塔时跳一次，买了等于只有一次收益。
+       现每层通关都 +treSum('twsb')，满四件每次跳 100 层。
+       起点仍受 towerFloor 影响，故用 S.sbDone 重算，避免连续跳层时层数被上一次的起点带偏。 */
+    S.towerFloor = f + 1 + treSum('twsb');
+    S.towerMaxHp = towerMaxHpFor(S.towerFloor,'sb');
+    S.towerHp = S.towerMaxHp;
+    renderTowerMode(); save(); return;
+  }
+  const gain = towerPtsFor(f);
+  S.pts = dadd(S.pts || D(0), gain);                 /* 转生点奖励（已是大数，无需再 D() 包一层） */
+  questAdd('kill', 1);
+  { const _bn = frBoxDrop(BOX_DROP_TOWER); if(_bn > 0){ resAdd('box', _bn); questAdd('getbox', _bn); logMsg('凡人塔第 '+f+' 层掉落凡尘宝箱 ×'+_bn); } }
+  if(f > (S.towerDone||0)) S.towerDone = f;
+  if(f > (S.stFrF||0)) S.stFrF = f;
+  S.poison = 0;                                     /* 每层换怪，毒层从 0 重新叠 */
+  logMsg('凡人塔第 '+f+' 层通关！转生点 +'+dStr(gain));
+  toast('第 '+f+' 层通关！转生点 +'+dStr(gain));
+  /* 凡人塔改为无限层：原满 1000 层会强制 exitTower() 退出并锁死入口，
+     进度停在 1000 不再增长；现直接推进到下一层，可无限爬。
+     1.56：跃层宝物【每次击败都生效】——原仅进入塔时跳一次，买了等于只有一次收益。
+     现每层通关都 +treSum('twfr')，满四件每次跳 100 层。 */
+  S.towerFloor = S.towerDone + 1 + treSum('twfr');
+  S.towerMaxHp = towerMaxHpFor(S.towerFloor,'fr');
+  S.towerHp = S.towerMaxHp;
+  renderTowerMode(); save();
+}
+/* 敌人区视觉统一同步：wolfImg / towerImg / towerImgSB 由本函数独家控制。
+   原三个 apply*UI() 都直接操作 wolfImg，靠「谁最后调用谁赢」的隐式约定 ——
+   applyBossUI() 是收尾调用且无条件 display=on?'block':'none'，退出 BOSS 时会
+   把秘境 / 塔的立绘一并抹掉（初始化也必须严格按 secret→tower→boss 顺序，非常脆弱）。
+   现三个 apply*UI() 只管各自的状态标记与 modeBar，本函数按优先级决定谁可见，
+   调用顺序不再有任何影响。 */
+function syncEnemyVisual(){
+  /* 底层主线怪图（.boss-img）由 applyRealmUI 在进入灵界时隐藏；
+     本函数是立绘显示的唯一真相源，凡人界所有路径都必须先把它恢复，
+     否则「进过一次灵界后主线怪物图永久不显示」。 */
+  document.querySelectorAll('.boss-img').forEach(function(e){ e.style.display = ''; });
+  const wl = $('wolfImg'), wt = $('towerImg'), ws = $('towerImgSB');
+  if(S.inBoss){                                   /* 优先级最高：BOSS 挑战立绘 */
+    if(ws) ws.style.display = 'none';
+    if(wt) wt.style.display = 'none';
+    if(wl){ wl.style.display = 'block'; setEnemyImg('boss', S.bossIdx); }
+    return;
+  }
+  if(S.inSecret){                                 /* 秘境：覆盖层显示首领/主线图 */
+    if(ws) ws.style.display = 'none';
+    if(wt) wt.style.display = 'none';
+    if(wl){ wl.style.display = 'block'; setEnemyImg('secret'); }
+    return;
+  }
+  if(S.inTower){                                  /* 塔：用专属图，覆盖层让位 */
+    if(wl) wl.style.display = 'none';
+    if(wt) wt.style.display = (S.towerType === 'sb') ? 'none' : 'block';
+    if(ws) ws.style.display = (S.towerType === 'sb') ? 'block' : 'none';
+    return;
+  }
+  /* 主线：隐藏全部覆盖层，露出底层 .boss-img（主线怪图） */
+  if(wl) wl.style.display = 'none';
+  if(wt) wt.style.display = 'none';
+  if(ws) ws.style.display = 'none';
+  setEnemyImg('main');
+}
+function applyTowerUI(){
+  const on = !!S.inTower, sb = on && S.towerType==='sb';
+  const bar = $('towerModeBar'); if(bar) bar.style.display = on ? '' : 'none';
+  syncEnemyVisual();                              /* 只设置本模式状态与 modeBar，图片统一由 syncEnemyVisual 决定 */
+}
+function renderTowerMode(){
+  if(!S.inTower) return;
+  $('tmName').textContent = towerName();
+  $('tmFloor').textContent = S.towerFloor;
+  const pw = $('tmPtsWrap'); if(pw) pw.style.display = (S.towerType==='sb') ? 'none' : '';
+  if(pw && S.towerType!=='sb') $('tmPts').textContent = dStr(S.pts || D(0));
+  if(S.towerMaxHp && S.towerHp){
+    const dh = dcmp(S.towerHp, D(0)) < 0 ? D(0) : S.towerHp;
+    const ratio = dNum(ddiv(dh, S.towerMaxHp));                 /* 统一走 dRatio/dNum，避免手写指数运算在量级悬殊时下溢为 0 */
+    const pct = Math.max(0, Math.min(100, ratio*100));
+    $('hpFill').style.width = pct+'%';
+    $('hpText').textContent = dStr(dh)+' / '+dStr(S.towerMaxHp);
+  }
+}
+
+
+/* ============ BOSS 挑战 ============
+   凡界：8 个 BOSS 各掉落一种永久奖励；可无限挑战，每次通关血量 ×2
+   每界 9 个 BOSS，各掉落一种永久奖励；可无限挑战，每次通关血量 ×2
+   毒层数 +1 为特殊奖励（数值固定 +1），其余奖励给得较高
+*/
+const BOSS_WORLDS = [
+  {k:'fj', n:'凡界'}
+];
+/* type 对应奖励键；val 为每次通关的奖励量 */
+const BOSS_REWARDS = {
+  fatk:  {n:'固定攻击',   unit:'',   val:800},
+  patk:  {n:'百分比攻击', unit:'%',   val:60},
+  rb:    {n:'转生币',     unit:'%',   val:50},      /* 百分比加成转生币获取（第3关） */
+  cdm:   {n:'暴击伤害',   unit:'%',   val:250},
+  psn:   {n:'毒伤害',     unit:'%',   val:200},
+  plc:   {n:'毒层上限',   unit:'',    val:300},
+  psnadd:{n:'毒层+1',     unit:'',    val:1},      /* 特殊：每次攻击额外叠毒层数 */
+  fdm:   {n:'最终伤害',   unit:'%',   val:100},
+  neili: {n:'内力加成',   unit:'%',   val:12}
+};
+/* 凡界 9 个 BOSS 共用一张 BOSS 立绘（560×315 JPEG，内嵌 base64，全文件只存一份） */
+const IMG_BOSS = 'data:image/jpeg;base64,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';
+const BOSS_LIST = [
+  {img:IMG_BOSS, n:'血刀老祖', t:'fatk'},
+  {img:IMG_BOSS, n:'铁掌帮主', t:'patk'},
+  {img:IMG_BOSS, n:'轮回尊者', t:'rb'},
+  {img:IMG_BOSS, n:'黑风寨主', t:'cdm'},
+  {img:IMG_BOSS, n:'五毒教主', t:'psn'},
+  {img:IMG_BOSS, n:'阴山老妖', t:'plc'},
+  {img:IMG_BOSS, n:'血河车尊', t:'psnadd'},
+  {img:IMG_BOSS, n:'九幽剑魔', t:'fdm'},
+  {img:IMG_BOSS, n:'镇岳石魔', t:'neili'}
+];
+function bossCntArr(k){
+  if(!S.bossCnt) S.bossCnt = {};
+  if(!S.bossCnt[k]) S.bossCnt[k] = BOSS_LIST.map(function(){ return 0; });   /* 长度跟随 BOSS_LIST（现 9 个） */
+  while(S.bossCnt[k].length < BOSS_LIST.length) S.bossCnt[k].push(0);
+  return S.bossCnt[k];
+}
+function bossBaseHp(i){ return dmul(D(1000000), dpow(D(3), i)); }
+/* 界别只有唯一真相源：S.bossWorld。
+   原另有模块变量 bossW，两者语义相同却要在 openBoss / switchBossWorld / applyBossUI / load 四处同步，
+   任何一条路径漏同步就会把通关进度写进错误的界别数组（读档恢复时 bossW 仍是默认 'fj' 即典型）。
+   switchBossWorld 里那句「bossW = k; S.bossWorld = k;」的双写本身就是冗余信号——既然总是同时改，
+   说明设计意图上就是同一个东西。现统一为 bossWorld() 读取函数。 */
+function bossWorld(){ const k = S.bossWorld || 'fj'; return BOSS_WORLDS.some(x => x.k === k) ? k : 'fj'; }
+/* 第 i 关基础血量 ×3^i（原 ×30 → ×6 → ×3，第1关不变） */
+function bossCurMaxHp(i){ return dmul(bossBaseHp(i), dpow(D(2), bossCntArr(bossWorld())[i] || 0)); }  /* 每次通关 ×2 */
+function bossUnlocked(i){ if(i === 0) return true; return (bossCntArr(bossWorld())[i-1] || 0) > 0; }
+function bossTotal(k){ return BOSS_REWARDS[k] ? (S['boss_'+k] || 0) * BOSS_REWARDS[k].val : 0; }
+function bossFat(){ return bossTotal('fatk'); }
+function bossPatk(){ return bossTotal('patk'); }
+function bossCdm(){ return bossTotal('cdm'); }
+function bossPsn(){ return bossTotal('psn'); }
+function bossPlc(){ return bossTotal('plc'); }
+function bossPsnAdd(){ return bossTotal('psnadd'); }
+function bossFdm(){ return bossTotal('fdm'); }
+function bossNeiliPct(){ return bossTotal('neili'); }
+/* 1.91 废弃：同上，已并入统一加法池 */
+function bossNeiliMul(){ return 1 + bossNeiliPct() / 100; }
+function bossRbPct(){ return bossTotal('rb'); }              /* BOSS挑战：转生币 +X% */
+function bossRbMul(){ return 1 + bossRbPct() / 100; }
+
+function openBoss(){ renderBoss(); $('bossOverlay').classList.add('show'); }
+function closeBoss(){ const o = $('bossOverlay'); if(o) o.classList.remove('show'); }
+
+function renderBoss(){
+  if(!$('bossGrid')) return;
+  $('bossWinTotal').textContent = nStr(S.bossWin || 0);
+  const arr = bossCntArr(bossWorld());
+  let html = '';
+  for(let i = 0; i < BOSS_LIST.length; i++){
+    const b = BOSS_LIST[i], rw = BOSS_REWARDS[b.t], cnt = arr[i] || 0;
+    const un = bossUnlocked(i);
+    const cur = S.inBoss && S.bossWorld === bossWorld() && S.bossIdx === i;
+    html += '<div class="bs-cell' + (un ? '' : ' lock') + (cur ? ' cur' : '') + '">';
+    html +=   '<div class="bs-head"><span class="bs-name">' + (i+1) + '. ' + b.n + '</span>';
+    html +=     '<span class="bs-cnt">通关 ' + nStr(cnt) + ' 次</span></div>';
+    html +=   '<div class="bs-hp">血量 ' + dStr(bossCurMaxHp(i)) + '</div>';
+    html +=   '<div class="bs-rw">奖励：<b>' + rw.n + ' +' + nStr(rw.val) + rw.unit + '</b>/次</div>';
+    html +=   '<div class="bs-have">已获 ' + nStr((S['boss_'+b.t] || 0) * rw.val) + rw.unit
+            + '（' + nStr(S['boss_'+b.t] || 0) + ' 层）</div>';
+    html +=   '<button class="bs-go' + (un ? '' : ' dis') + '"' + (un ? ' onclick="enterBoss(' + i + ')"' : ' disabled')
+            + '>' + (cur ? '挑战中' : (un ? '挑 战' : '需通关前一关')) + '</button>';
+    html += '</div>';
+  }
+  $('bossGrid').innerHTML = html;
+}
+function enterBoss(i){
+  exitLingToFr();                     /* 同上：挑战 BOSS 前先返回凡人界 */
+  /* 越界兜底：与 renderBossMode / bossKill 一致。存档被篡改时 bossCntArr 可能比 BOSS_LIST 长，
+     此时 bossUnlocked(i) 会误判为真，下面 BOSS_LIST[i].n 直接抛 TypeError 带崩战斗循环。 */
+  i = i | 0;
+  if(!(i >= 0) || i >= BOSS_LIST.length){ toast('BOSS 数据异常'); return; }
+  if(!bossUnlocked(i)){ toast('需先通关前一关'); return; }
+  /* 从秘境 / 塔 进入挑战BOSS：先退出原模式，否则 render() 会优先渲染原模式导致「点了没切换」 */
+  /* 注：exitSecret() 内部会调用 clearBossMode()，在此路径下属冗余调用（此时 S.inBoss 必为 false），
+     但 clearBossMode 有 if(!S.inBoss) return 兜底，无害；保留以兼容「秘境中残留 BOSS 状态」的极端情况。 */
+  if(S.inSecret){ exitSecret(); }
+  if(S.inTower){ exitTower(); }
+  S.inBoss = true; S.bossWorld = bossWorld(); S.bossIdx = i;
+  S.bossMaxHp = bossCurMaxHp(i); S.bossHp = S.bossMaxHp;
+  S.poison = 0;
+  applyBossUI(); render();                             /* render 内 inBoss 分支会调用 renderBossMode 刷新血条 */
+  closeBoss();
+  logMsg('挑战【' + BOSS_LIST[i].n + '】！第 ' + ((bossCntArr(bossWorld())[i] || 0) + 1) + ' 次');
+  toast('BOSS 挑战开始');
+  save();
+}
+/* 静默退出 BOSS 挑战（切换到其它模式时调用，不弹提示、不重复 save） */
+function clearBossMode(){
+  if(!S.inBoss) return;
+  S.inBoss = false;
+  applyBossUI();
+}
+function exitBoss(){
+  S.inBoss = false; applyBossUI(); render();
+  logMsg('退出 BOSS 挑战，返回主线'); toast('返回主线'); save();
+}
+function applyBossUI(){
+  const on = !!S.inBoss;
+  const bar = $('bossModeBar'); if(bar) bar.style.display = on ? '' : 'none';
+  syncEnemyVisual();                     /* 同上：本函数不直接操作图片，避免「最后调用者胜出」 */
+}
+function renderBossMode(){
+  if(!S.inBoss) return;
+  /* bossIdx 越界防御：旧档字段缺失或 BOSS_LIST 增删后可能为 undefined/负数/越界，
+     BOSS_LIST[undefined].n 会抛 TypeError，render() 整体崩溃、界面彻底卡死。
+     越界时直接静默退出 BOSS 模式并收尾，而不是让整个渲染挂掉。 */
+  const _bi = (typeof S.bossIdx === 'number' && isFinite(S.bossIdx)) ? (S.bossIdx | 0) : 0;
+  const _bd = BOSS_LIST[_bi];
+  if(!_bd){ S.inBoss = false; if(typeof applyBossUI === 'function') applyBossUI(); return; }
+  if(S.bossIdx !== _bi) S.bossIdx = _bi;                    /* 归一化非法/小数下标，避免后续写入错位 */
+  $('bmName').textContent = _bd.n;
+  $('bmCnt').textContent = (bossCntArr(bossWorld())[_bi] || 0) + 1;
+  if(S.bossMaxHp && S.bossHp){
+    const dh = dcmp(S.bossHp, D(0)) < 0 ? D(0) : S.bossHp;
+    const ratio = dNum(ddiv(dh, S.bossMaxHp));                 /* 同上 */
+    const pct = Math.max(0, Math.min(100, ratio * 100));
+    $('hpFill').style.width = pct + '%';
+    $('hpText').textContent = dStr(dh) + ' / ' + dStr(S.bossMaxHp);
+  }
+}
+function doBossHit(manual){
+  hitInc();
+  if(!S.bossHp || dcmp(S.bossHp, D(0)) <= 0){ S.bossMaxHp = bossCurMaxHp(S.bossIdx); S.bossHp = S.bossMaxHp; }
+    const _atk = calcAtk();                                /* 缓存攻击力（原每连击段重复计算，段数多时开销大） */
+  let sum = dmul(_atk, D(0.92 + Math.random() * 0.16));
+  let critN = 0, comboN = 0;
+  const crit = Math.random() * 100 < calcCrit();
+  if(crit){ sum = dmul(sum, D(critMult())); critN = 1 + critExtra();
+    }
+  sum = dadd(sum, dmul(_atk, D(calcIgn() / 100)));        /* 无视防御附加真伤（原三模式完全缺失） */
+  { const _cs = {n:0, hit:false};
+    sum = comboAdd(sum, _atk, 0.15, 0.92, 0.16, _cs);
+    if(_cs.hit) comboN += _cs.n; }
+  { const _pn = gfSum('psnhit');
+    if(_pn > 0 && S.poison > 0) sum = dadd(sum, dmul(dmul(D(S.poison), D(_pn)), D(psnMultSum()))); }
+  sum = dmul(sum, D(1 + tSum('nmult') / 100));            /* 猛攻之势 / 屠戮本能 */
+  sum = dmul(sum, D(1 + calcFdm() / 100));                /* 最终伤害乘区 */
+  if(ignAmpMul() > 1) sum = dmul(sum, D(ignAmpMul()));    /* 破界神锋 */
+  S.ndxStack += 1 + tSum('ndxplus');                      /* 不死不休叠层（原三模式完全不叠） */
+  sum = dmul(sum, D(1 + calcNdx() / 100));                /* 不死不休伤害加成 */
+if(manual) S.clicks++;
+  S.poison = Math.min(poisonCap(), S.poison + poisonAdd());
+  S.totalDmg = dadd(S.totalDmg || D(0), sum);
+  S.bossHp = dadd(S.bossHp, dNeg(sum));
+  if(dcmp(S.bossHp, D(0)) < 0) S.bossHp = D(0);
+  let poison = D(0);
+  if(psnPerStack() > 0){ poison = calcPsnDmg(S.poison);
+    S.totalDmg = dadd(S.totalDmg || D(0), poison);
+    S.bossHp = dadd(S.bossHp, dNeg(poison));
+    if(dcmp(S.bossHp, D(0)) < 0) S.bossHp = D(0);
+  }
+  achHit(sum, crit, poison);                           /* 移出毒伤分支 */
+  /* 斩杀线天赋（原仅主线判定，BOSS 中失效） */
+  const _line = tSum('line');
+  if(_line > 0 && dcmp(S.bossHp, dmul(S.bossMaxHp, D(_line / 100))) <= 0 && dcmp(S.bossHp, D(0)) > 0) S.bossHp = D(0);
+  if(dcmp(S.bossHp, D(0)) <= 0) bossKill();
+  return {sum:sum, crit:crit, critN:critN, combo:comboN>0, comboN:comboN, poison:poison};
+}
+function bossKill(){
+  S.ndxStack = 0;                                    /* 击杀后清空不死不休层数（主线 killBoss 已清，此处补齐） */
+  resAdd('soul', soulGain());                            /* 灵魂：击杀 +1 */
+  /* 越界防御：与 renderBossMode() 保持一致。存档被污染 / BOSS_LIST 增删条目 / 旧档缺字段时
+     b 为 undefined，b.t 直接抛 TypeError，会把整个战斗循环带崩、界面卡死。
+     这里静默退出 BOSS 模式，不发放奖励（奖励依赖 b.t，无法安全计算）。 */
+  const i = S.bossIdx | 0;
+  const b = BOSS_LIST[i];
+  if(!b || !BOSS_REWARDS[b.t]){ S.inBoss = false; applyBossUI(); return; }
+  const rw = BOSS_REWARDS[b.t];
+  const arr = bossCntArr(bossWorld());
+  /* 顺序不可调换：必须先递增通关计数，下面 bossCurMaxHp(i) 用的是「递增后」的次数
+     （第 N 次挑战血量更高）。若把递增挪到后面，下一只会拿到旧血量，难度曲线失效。 */
+  arr[i] = (arr[i] || 0) + 1;
+  S['boss_' + b.t] = (S['boss_' + b.t] || 0) + 1;
+  S.bossWin = (S.bossWin || 0) + 1;
+  S.poison = 0;
+  logMsg('通关【' + b.n + '】第 ' + arr[i] + ' 次！' + rw.n + ' +' + nStr(rw.val) + rw.unit);
+  toast('通关！' + rw.n + ' +' + nStr(rw.val) + rw.unit);
+  questAdd('kill', 1);
+  S.bossMaxHp = bossCurMaxHp(i);          /* 下次挑战血量 ×2，无限挑战 */
+  S.bossHp = S.bossMaxHp;
+  renderBossMode(); render(); save();
+  /* 面板开着时同步刷新：renderBossMode 只更新战斗条，通关次数 / 已获层数要等重开面板才变。
+     renderBoss() 内部取 $('bossGrid')，面板未打开时自然空跑，代价可忽略。 */
+  renderBoss();
+}
+
+/* ============ 神兵录 · 凡尘卷 兵器系统 ============ */
+/* 品质：T 凡铁(只加基础) / L 利器(只加百分比) / S 绝世(特殊效果) —— 每种品质 3 件 */
+const WEAPONS = [
+  {q:'T', n:'锈铁刀',   v:120}, {q:'T', n:'裂石斧', v:120}, {q:'T', n:'玄铁枪', v:120},
+  {q:'L', n:'寒月刀',   v:15},  {q:'L', n:'赤霄剑', v:15},  {q:'L', n:'裂空戟', v:15},
+  {q:'S', n:'血獠魔斧', v:1,  fx:'dual'}, {q:'S', n:'噬魂魔幡', v:12, fx:'psn'}, {q:'S', n:'破军魔剑', v:10, fx:'fdm'},
+  /* 1.81：新增 6 件，把「攻速 / 暴击 / 暴伤 / 破防 / 毒层上限 / 内力」也纳入兵器体系。
+     追加在数组末尾 —— S.weap / S.weapQ 按索引存档，插到中间会让老档全部错位。
+     fx 字段决定归入哪个加成通道；无 fx 的仍按老口径（T=基础攻击、L=攻击%）。 */
+  {q:'L', n:'流光刃',   v:8,  fx:'spd'},
+  {q:'L', n:'碎星刺',   v:6,  fx:'crit'},
+  {q:'S', n:'狂澜戟',   v:9,  fx:'cdm'},
+  {q:'S', n:'破甲锥',   v:7,  fx:'ign'},
+  {q:'S', n:'蚀骨鞭',   v:40, fx:'pcap'},
+  {q:'T', n:'纳灵环',   v:6,  fx:'neili'},
+  /* 1.84：新增「神品」档（凡人界此前只有 凡铁 / 利器 / 绝世 三档，高端档位空置）。
+     追加在末尾 —— S.weap / S.weapQ 按索引存档，插到中间会让老档全部错位。
+     数值定位：约为绝世同通道的 2.5 倍，配合本档共鸣（20/50/100%）形成后期目标。 */
+  {q:'G', n:'太虚斩魂刃', v:25, fx:'fdm'},
+  {q:'G', n:'九幽蚀魂幡', v:40, fx:'psn'},
+  {q:'G', n:'流光太虚翼', v:25, fx:'spd'},
+  {q:'G', n:'洞虚天诛戟', v:30, fx:'cdm'},
+  {q:'G', n:'万劫毒渊',   v:120,fx:'pcap'}
+];
+/* 1.81：各加成通道的显示名（分类展示 / 描述用） */
+const WEAP_FX_NAME = {dual:'每次攻击额外叠毒', psn:'毒伤', fdm:'最终伤害', spd:'攻速', crit:'暴击率',
+                      cdm:'暴伤', ign:'破防', pcap:'毒层上限', neili:'内力获取'};
+const WEAP_FX_UNIT = {dual:' 层', psn:'%', fdm:'%', spd:'%', crit:'%', cdm:'%', ign:'%', pcap:'', neili:'%'};
+/* 1.81：兵器分组（把九兵按加成方向归类，条目多了才不显得乱） */
+const WEAP_GROUPS = [
+  {n:'攻 伐', fx:[null,'L0'], q:['T','L'], d:'基础攻击 / 攻击 %'},
+  {n:'毒 道', fx:['dual','psn','pcap'], q:['S','G'], d:'叠毒 / 毒伤 / 毒层上限'},
+  {n:'暴 击', fx:['crit','cdm'], q:['L','S','G'], d:'暴击率 / 暴伤'},
+  {n:'穿 透', fx:['ign'], q:['S'], d:'破防'},
+  {n:'疾 速', fx:['spd'], q:['L','G'], d:'攻速'},
+  {n:'内 力', fx:['neili'], q:['T'], d:'内力获取'}
+];
+const SHARD_KEY = {T:'shardT', L:'shardL', S:'shardS', G:'shardS'};   /* 1.84：神品沿用绝世碎片，成本另按 WEAP_Q_COSTMUL 拉开 */
+function weapLv(i){ return (S.weap && S.weap[i]) || 0; }
+function weapSum(q, fx){
+  let v=0;
+  for(let i=0;i<WEAPONS.length;i++){
+    const w=WEAPONS[i];
+    /* 1.81：fx 省略时只统计「无 fx」的兵器 —— 否则新增的流光刃(攻速)/碎星刺(暴击)
+       会被一并算进 weapPct() 的攻击%，造成数值串味。 */
+    if(w.q!==q) continue;
+    if(fx){ if(w.fx!==fx) continue; } else if(w.fx) continue;
+    const lv=weapLv(i); if(lv>0) v += w.v*lv*(1 + weapQLv(i)*WEAP_Q_STEP/100);   /* 1.58 淬炼 */
+  }
+  return v;
+}
+/* 1.81：新增加成通道（各自独立，互不串味） */
+/* 1.84：神品与绝世共用同一加成通道，各吃本档共鸣（数值直接相加） */
+function _weapDualQ(fx){ return weapSum('S',fx) * (1 + weapSetPct('S')/100) + weapSum('G',fx) * (1 + weapSetPct('G')/100); }
+/* 2.03：兵器攻速词条统一打折（WEAP_SPD_NERF），与凡人界攻速整体削弱同口径 */
+const WEAP_SPD_NERF = 0.5;
+function weapSpd(){  return WEAP_SPD_NERF * (weapSum('L','spd')  * (1 + weapSetPct('L')/100) + weapSum('G','spd') * (1 + weapSetPct('G')/100)); }
+function weapCrit(){ return weapSum('L','crit') * (1 + weapSetPct('L')/100); }
+function weapCdm(){  return _weapDualQ('cdm'); }
+function weapIgn(){  return weapSum('S','ign')  * (1 + weapSetPct('S')/100); }
+function weapPCap(){ return _weapDualQ('pcap'); }
+function weapNeili(){return weapSum('T','neili')* (1 + weapSetPct('T')/100); }
+/* ==================== 1.58 凡人界深度②：武器「品阶共鸣」+ 淬炼 ====================
+   组合搭配向：同品阶 3 件武器「全部圆满」即触发共鸣，再按三件淬炼总层数升档。
+   与功法同理只做加法：不改原武器数值，老档玩家不会变弱。
+   淬炼是第二层投入：圆满后用同品质碎片继续强化，玩家要权衡「均衡升三件凑共鸣」还是「单件拉满」。 */
+const WEAP_Q_MAX = 10, WEAP_Q_STEP = 8;       /* 淬炼上限 10 层，每层 +8% 该武器效果 */
+const WEAP_SETS = [
+  {k:'T', n:'凡铁', c:'#c9b27a', d:'基础攻击', tiers:[{q:0,p:20},{q:9,p:50},{q:21,p:100}]},
+  {k:'L', n:'利器', c:'#7fd4ff', d:'攻击 %',   tiers:[{q:0,p:20},{q:9,p:50},{q:21,p:100}]},
+  {k:'S', n:'绝世', c:'#ff8a7a', d:'特殊效果', tiers:[{q:0,p:20},{q:9,p:50},{q:21,p:100}]},
+  {k:'G', n:'神品', c:'#ffd54a', d:'神品特效', tiers:[{q:0,p:20},{q:9,p:50},{q:21,p:100}]}
+];
+function weapQLv(i){ return (S.weapQ && S.weapQ[i]) || 0; }
+function weapQCost(i){
+  const w = WEAPONS[i]; if(!w) return 0;
+  return Math.min(SAFE_INT, Math.round(weapCost(10, w.q) * 1.4 * Math.pow(2.15, weapQLv(i))));
+}
+function upWeapQ(i){
+  const w = WEAPONS[i]; if(!w) return;
+  if(weapLv(i) < 10){ toast('需先升至十级圆满'); return; }
+  if(weapQLv(i) >= WEAP_Q_MAX){ toast(w.n + ' 已淬炼圆满'); return; }
+  const key = SHARD_KEY[w.q], cost = weapQCost(i);
+  if((S[key]||0) < cost){ toast('碎片不足（还需 ' + nStr(cost - (S[key]||0)) + '）'); return; }
+  S[key] -= cost;
+  S.weapQ = S.weapQ || {}; S.weapQ[i] = weapQLv(i) + 1;
+  toast(w.n + ' 淬炼 ' + S.weapQ[i] + ' 层');
+  logMsg(w.n + ' 淬炼至 ' + S.weapQ[i] + ' 层（效果 +' + (S.weapQ[i]*WEAP_Q_STEP) + '%）');
+  renderWeap(); render(); save();
+}
+function weapSetInfo(q){
+  const s = WEAP_SETS.find(function(x){ return x.k === q; });
+  if(!s) return {t:0,p:0,sum:0,next:null,all:false,tot:0};
+  let sum = 0, tot = 0, all = true;
+  for(let i = 0; i < WEAPONS.length; i++){
+    if(WEAPONS[i].q !== q) continue;
+    tot++;
+    sum += weapQLv(i);
+    if(weapLv(i) < 10) all = false;
+  }
+  if(!all || tot === 0) return {t:0,p:0,sum:sum,next:s.tiers[0],all:false,tot:tot};
+  let t = 0, p = 0;
+  for(let i = 0; i < s.tiers.length; i++){ if(sum >= s.tiers[i].q){ t = i + 1; p = s.tiers[i].p; } }
+  return {t:t, p:p, sum:sum, next:(t < s.tiers.length) ? s.tiers[t] : null, all:true, tot:tot};
+}
+function weapSetPct(q){ return weapSetInfo(q).p; }
+function weapFlat(){ return weapSum('T') * (1 + weapSetPct('T')/100); }    /* 凡铁：基础攻击（含共鸣） */
+function weapPct(){ return weapSum('L') * (1 + weapSetPct('L')/100); }     /* 利器：攻击百分比（含共鸣） */
+function weapDual(){ return weapSum('S','dual'); }           /* 血獠魔斧：每次攻击额外叠毒层数（10 级 = 10 层） */
+function weapPsnMult(){ return _weapDualQ('psn'); }   /* 噬魂魔幡 / 九幽蚀魂幡：毒伤 %（各含本档共鸣） */
+function weapFdm(){ return _weapDualQ('fdm'); }       /* 破军魔剑 / 太虚斩魂刃：最终伤害 %（各含本档共鸣） */
+/* 1.81：升级消耗按品质拉开 —— 原实现三品同价，绝世（带特殊效果）和凡铁一样便宜，
+   等于把最强档白送。现 凡铁 ×1 / 利器 ×3.2 / 绝世 ×14，与强度梯度对齐。
+   淬炼 weapQCost 复用本函数，故同步自动拉开，无需另设系数。 */
+const WEAP_Q_COSTMUL = {T:1, L:4, S:30, G:300};   /* 1.85：高品质消耗再提高（神品 ×40 → ×300） */
+function weapCost(lv, q){
+  const base = (lv === 0) ? 100 : Math.round(900 * Math.pow(1.9, lv-1));
+  return Math.round(base * (q ? (WEAP_Q_COSTMUL[q] || 1) : 1));
+}
+function weapDesc(w, lv){
+  const cur = w.v * lv, nx = w.v * (Math.min(lv,9)+1);
+  const tail = (lv<10 ? ' → +' + nx : '（圆满）');
+  if(w.fx){
+    const nm = WEAP_FX_NAME[w.fx] || w.fx, un = WEAP_FX_UNIT[w.fx] || '';
+    if(w.fx === 'dual') return nm + ' ' + cur + ' 层' + (lv<10 ? ' → ' + nx + ' 层' : '（圆满）');
+    return nm + ' +' + cur + un + tail + un;
+  }
+  if(w.q==='T') return '基础攻击 +' + cur + tail;
+  return '攻击力 +' + cur + '%' + tail + '%';
+}
+function openWeap(){
+  renderWeap(); $('weapOverlay').classList.add('show');
+}
+function closeWeap(){ $('weapOverlay').classList.remove('show'); }
+function renderWeap(){
+  $('wpShT').textContent = nStr(S.shardT||0);
+  $('wpShL').textContent = nStr(S.shardL||0);
+  $('wpShS').textContent = nStr(S.shardS||0);
+  const body=$('wpBody');
+  let h='<div class="wp-banner tower-sb-bg">'+
+        '<div class="wp-banner-txt">凡尘卷 · 四品二十兵<span>凡铁加基础 · 利器加百分比 · 绝世藏玄机 · 神品极致</span></div></div>';
+  /* 1.58 品阶共鸣：同品阶 3 件全部圆满即触发，再按三件淬炼总层数升档 */
+  h += '<div class="syn-box">';
+  WEAP_SETS.forEach(function(sp){
+    const r = weapSetInfo(sp.k);
+    const tip = r.all
+      ? (r.next ? ('淬炼 ' + r.sum + ' → ' + r.next.q + ' 层 → +' + r.next.p + '%') : '已圆满 +' + r.p + '%')
+      : ('需 3 件全部圆满（当前 ' + (function(){ let c=0,t=0; for(let i=0;i<WEAPONS.length;i++){ if(WEAPONS[i].q!==sp.k) continue; t++; if(weapLv(i)>=10) c++; } return c+'/'+t; })() + '）');
+    const fill = r.all ? (r.next ? Math.min(100, Math.round(r.sum / Math.max(1, r.next.q) * 100)) : 100)
+                       : (function(){ let c=0,t=0; for(let i=0;i<WEAPONS.length;i++){ if(WEAPONS[i].q!==sp.k) continue; t++; if(weapLv(i)>=10) c++; } return Math.round(c/Math.max(1,t)*100); })();
+    h += '<div class="syn-row"><span class="syn-nm" style="color:' + sp.c + '">' + sp.n + '</span>' +
+         '<span class="syn-bar"><i style="width:' + fill + '%;background:' + sp.c + '"></i></span>' +
+         '<span class="syn-v">' + (r.p ? '<b style="color:' + sp.c + '">+' + r.p + '%</b>' : '未激活') + '</span></div>' +
+         '<div class="syn-tip">' + tip + '</div>';
+  });
+  h += '</div>';
+  /* 1.81：兵器增至 15 件、加成方向增至 6 类 —— 仍按「凡铁/利器/绝世」三品平铺会很长且不好找，
+     改为按【加成方向】分组，组内再标品质。 */
+  const groups = WEAP_GROUPS;
+  groups.forEach(function(g){
+    h+='<div class="wp-grp">'+g.n+'<i>'+g.d+'</i></div>';
+    WEAPONS.forEach(function(w,i){
+      if(g.q.indexOf(w.q) < 0) return;
+      const _fx = w.fx || null;
+      const _inG = g.fx.some(function(f){
+        if(f === null) return !w.fx && w.q === 'T';
+        if(f === 'L0') return !w.fx && w.q === 'L';
+        return w.fx === f;
+      });
+      if(!_inG) return;
+      const lv=weapLv(i), key=SHARD_KEY[w.q], own=S[key]||0;
+      const cost=weapCost(lv, w.q), can=lv<10 && own>=cost;
+      const qn={T:'凡铁',L:'利器',S:'绝世',G:'神品'}[w.q]||w.q;
+      const ql=weapQLv(i), qc=weapQCost(i), canQ=lv>=10 && ql<WEAP_Q_MAX && own>=qc;
+      h+='<div class="wp-card q-'+w.q+'">'+
+         '<div class="wp-nm"><b><span style="color:'+({T:'#c9b27a',L:'#7fd4ff',S:'#ff8a7a',G:'#ffd54a'}[w.q]||'#ccc')+'">'+qn+'</span> · '+w.n+(ql?'<span class="q-gem" style="color:#ffd76a">淬 '+ql+'</span>':'')+'</b><div>'+weapDesc(w,lv)+(ql?'　<b style="color:#ffd76a">（+'+(ql*WEAP_Q_STEP)+'%）</b>':'')+'</div></div>'+
+         '<div class="wp-lv">Lv '+lv+'/10</div>'+
+         (lv>=10
+           ? (ql>=WEAP_Q_MAX
+               ? '<span class="wp-lv" style="color:#ffd76a">淬炼圆满</span>'
+               : '<button class="wp-up'+(canQ?'':' off')+'" onclick="'+(canQ?'upWeapQ('+i+')':'toast(\'碎片不足（还需 '+nStr(qc-(S[key]||0))+'）\')')+'">淬炼 '+nStr(qc)+'</button>')
+           : '<button class="wp-up'+(can?'':' off')+'" onclick="upWeap('+i+')">'+(lv===0?'解锁':'升级')+' '+nStr(cost)+'</button>')+
+         '</div>';
+    });
+  });
+  h+='<div class="wp-tip">神兵塔掉落，越高层越多。同品阶三件全圆满触发<b>共鸣</b>，淬炼可继续升档。'
+     +'<br>消耗按品质递增：<b style="color:#c9b27a">凡铁 ×1</b>　<b style="color:#7fd4ff">利器 ×4</b>　<b style="color:#ff8a7a">绝世 ×30</b>　<b style="color:#ffd54a">神品 ×300（消耗绝世碎片）</b></div>';
+  body.innerHTML=h;
+}
+function upWeap(i){
+  const w=WEAPONS[i]; if(!w) return;
+  const lv=weapLv(i);
+  if(lv>=10){ toast('已达十级圆满'); return; }
+  const key=SHARD_KEY[w.q], cost=weapCost(lv, w.q);
+  if((S[key]||0) < cost){ toast('碎片不足（还需 '+nStr(cost-(S[key]||0))+'）'); return; }
+  S[key] -= cost;
+  S.weap = S.weap || {}; S.weap[i] = lv+1;
+  toast(w.n+' → Lv '+(lv+1));
+  logMsg(w.n+' 提升至 Lv '+(lv+1));
+  renderWeap(); render(); save();
+}
+
+
+/* ══════ 通用操作弹窗（1.81）══════
+   此前：点击已装备的法宝 / 已镶嵌的符文 = 直接卸下；点击技能 = 直接升级。
+   问题：误触代价高（好不容易强化的法宝点一下就没了），且看不到完整信息就要做决定。
+   现改为：点击 → 弹窗展示完整详情 + 全部可执行操作，由玩家再选。 */
+function openItemSheet(title, html){
+  const t=$('ishTitle'), b=$('ishBody'); if(!t||!b) return;
+  t.textContent = title || '操 作';
+  b.innerHTML = html || '';
+  $('ishOverlay').classList.add('show');
+}
+function closeItemSheet(){ const o=$('ishOverlay'); if(o) o.classList.remove('show'); }
+
+/* ============ 自定义加点 ============ */
+let cuKey = null;
+function openCustom(k){
+  cuKey = k;
+  const a = ATTRS.find(x => x.k === k);
+  if(!a) return;
+  $('cuName').textContent = a.name + '（当前 Lv.' + S[k + 'Lv'] + '）';
+  $('cuInput').value = '';
+  $('cuTip').textContent = '可用转生币 ' + dStr(S.pts || D(0)) + ' · 上限 ' + (a.max === Infinity ? '无' : a.max);
+  $('cuOverlay').classList.add('show');
+  setTimeout(function(){ const el = $('cuInput'); if(el && el.focus) el.focus(); }, 90);
+}
+function closeCustom(){ $('cuOverlay').classList.remove('show'); }
+function cuQuick(n){ $('cuInput').value = n; }
+function cuMax(){
+  if(!cuKey) return;
+  const a = ATTRS.find(x => x.k === cuKey);
+  const cur = S[cuKey + 'Lv'];
+  const room = isFinite(a.max) ? Math.max(0, a.max - cur) : 1e15;
+  const n = room > 0 ? maxAfford(a, cur, room) : 0;
+  $('cuInput').value = n;
+  $('cuTip').textContent = '最多可加 ' + n + ' 级，共需 ' + dStr(costFor(a, cur, n)) + ' 转生币';
+}
+function confirmCustom(){
+  if(!cuKey) return;
+  const n = parseInt($('cuInput').value, 10);
+  if(!n || n < 1){ toast('请输入要加的点数'); return; }
+  closeCustom();
+  buy(cuKey, n);
+}
+
+
+/* ============ 遗物系统 ============ */
+/* 1.81：遗物品阶与分类。
+   · 此前所有遗物一律「10 碎片合成」、升级消耗也完全相同 —— 通玄（最终伤害）与
+     聚宝（宝箱产出）等价，高阶遗物等于白送，玩家没有取舍。
+     现按品阶定价：合成 ×[10,40,160,640,2560]、升级 / 突破 ×[1,3,9,27,81]。
+   · 遗物变多后按「攻伐 / 毒道 / 产出」三类分组显示，避免一长条找不到目标。 */
+const RELIC_Q  = ['凡品','灵品','玄品','神品','仙品'];
+const RELIC_QC = ['#b0b0b0','#5cc75c','#64b5f6','#d896f0','#ffd54a'];   /* 2.18：深色底上提亮——原神品紫 #9c27b0 对比度仅 2.6，小字发虚 */
+/* 1.85：高品质消耗再提高 —— 神品 / 仙品的强度远高于低阶，原先 4 倍 / 5 倍档差不足以体现稀缺性。 */
+const RELIC_CRAFT = [10, 50, 400, 6000, 150000];   /* 合成碎片：品阶越高越贵 */
+const RELIC_Q_MUL = [1, 8, 80, 1200, 25000];       /* 升级 / 突破消耗系数（2.03：高品质所需大幅拉开）*/
+const RELIC_CAT = [
+  {k:'war', n:'攻 伐'},
+  {k:'psn', n:'毒 道'},
+  {k:'src', n:'产 出'}
+];
+function relicDef(k){ for(let i=0;i<RELICS.length;i++) if(RELICS[i].k===k) return RELICS[i]; return null; }
+function relicQ(k){ const r = relicDef(k); return r ? (r.q || 0) : 0; }
+const RELICS = [
+  {k:'patk', n:'破锋遗物', v:50, q:1, c:'war', d:'攻击力 +50%'},
+  {k:'cdm',  n:'裂魂遗物', v:80, q:2, c:'war', d:'暴击伤害 +80%'},
+  {k:'pcap', n:'蚀骨遗物', v:50, q:0, c:'psn', d:'毒层上限 +50'},
+  {k:'psn',  n:'腐毒遗物', v:80, q:1, c:'psn', d:'毒伤害 +80%'},
+  {k:'fdm',  n:'通玄遗物', v:50, q:3, c:'war', d:'最终伤害 +50%'},
+  /* 1.56 新增 6 件：补上此前完全空白的乘区（暴击率 / 攻速 / 连击 / 破防 / 内力 / 丹药） */
+  {k:'crit', n:'洞玄遗物', v:15, q:2, c:'war', d:'暴击率 +15%'},
+  {k:'spd',  n:'流光遗物', v:30, q:2, c:'war', d:'攻击速度 +30%'},
+  {k:'combo',n:'连环遗物', v:40, q:2, c:'war', d:'连击率 +40%'},
+  {k:'ign',  n:'破甲遗物', v:30, q:1, c:'war', d:'破防 +30%'},
+  {k:'neili',n:'纳灵遗物', v:60, q:0, c:'src', d:'内力获取 +60%'},
+  {k:'box',  n:'聚宝遗物', v:50, q:0, c:'src', d:'凡尘宝箱产出 +50%'},
+  /* 1.81 新增 2 件：补上此前完全没有遗物覆盖的方面 */
+  {k:'ndx',  n:'不息遗物', v:30, q:3, c:'war', d:'不死不休 +30%'},
+  {k:'frag', n:'拾遗遗物', v:80, q:1, c:'src', d:'遗物碎片 +80%'},
+  /* 1.84：补齐「仙品」档 —— 原表 13 件最高只到神品，仙品完全空置。
+     k 即效果键（relicVal 按 k 取值），故用此前尚未接入遗物的 poison / rbpts，并同步接入公式。 */
+  {k:'poison', n:'蚀天遗物', v:3,   q:4, c:'psn', d:'每次攻击叠毒层数 +3'},
+  {k:'rbpts',  n:'轮回遗物', v:300, q:4, c:'src', d:'转生点获取 +300%'},
+  /* 2.10：产出类补「种子收获」—— 此前遗物完全不覆盖药园产量，
+     产出组只有内力 / 宝箱 / 碎片 / 转生点四项。 */
+  {k:'seed', n:'穰穰遗物', v:120, q:4, c:'src', d:'药园种子收获 +120%'}
+];
+const RELIC_LV_MAX = 10;                                  /* 每件遗物升满 10 级后可突破 1 次 */
+/* 可突破次数上限：必须与「碎片费用曲线 × 资源上限」匹配，否则 UI 虚标。
+   原值 100 不可达：relicBreakFrag(ad) = 200 × 3^ad，而 relicFrag 封顶 SAFE_INT(9.007e15)。
+   实测 ad=29 需 1.373e16 已超上限，故实际只能突破到 29 —— 面板却一直显示「/100」。
+   同时 2^ad 是效果倍率，ad=29 已达 ×5.4e8，再放开只会让数值彻底崩坏。 */
+/* 2.07：上限 29 → 100。原值 29 是「碎片封顶 9e15 下恰好可达」的倒推值，
+   而非设计值：玩家点满后 UI 才刚显示「化境」，根本没有继续成长的空间。
+   同时效果倍率由 2^突破次数（指数，29 次即 ×5.4e8，后期完全失控）改为线性
+   ×(1 + RELIC_AD_COEF × 次数)，配合上限放开让成长平滑可控。 */
+const RELIC_BREAK_MAX = 100;                              /* 可突破次数上限 */
+const RELIC_AD_COEF   = 1.0;                              /* 战斗类遗物：每次突破的效果增量（线性系数） */
+/* 2.08 产出类遗物（c === 'src'：内力 / 凡尘宝箱 / 种子等资源向）突破增量单独压低到 0.25。
+   前期（未突破）完全不受影响，只压后期高突破段。 */
+const RELIC_AD_COEF_RES = 0.25;
+function relicAdCoef(c){ return c === 'src' ? RELIC_AD_COEF_RES : RELIC_AD_COEF; }
+const RELIC_AD_POW    = 2;                                /* 消耗的多项式次数（1 = 纯线性，2 = 平方） */
+function relicAd(k){ return (S.relicAd && S.relicAd[k]) || 0; }          /* 突破次数 0~100 */
+function relicLv(k){ return (S.relicLv && S.relicLv[k]) || 0; }          /* 当前升级等级 0~10 */
+/* 遗物升级（1~10 级）所需碎片：随等级递增，并随突破次数 ×2.5^突破 */
+/* 遗物消耗（大数）：原用 Math.round(k * Math.pow(r, ad))，ad 上限 100 ——
+   2.5^100 ≈ 6e39、3^100 ≈ 5e47、2.4^100 ≈ 4e38，均远超 Number.MAX_SAFE_INTEGER(9.007e15)：
+   · 尾数精度丢失，费用不再精确，同一次突破在 UI 与校验处可能算出不同值
+   · Math.round 对 >2^53 的数无效（本来就不是整数），形同虚设
+   改用大数幂运算，精确表示与比较；扣费时若超出安全整数则直接判「资源不可能够」。 */
+function relicFgNeed(lv, ad, k){
+  const m = RELIC_Q_MUL[Math.max(0, Math.min(RELIC_Q_MUL.length - 1, relicQ(k)))];
+  return dmul(dmul(D(10 + 6 * ((lv || 1) - 1)), dpow(D(1 + (ad || 0)), RELIC_AD_POW)), D(m));
+}
+function relicBreakFrag(ad, k){
+  const m = RELIC_Q_MUL[Math.max(0, Math.min(RELIC_Q_MUL.length - 1, relicQ(k)))];
+  return dmul(dmul(D(200), dpow(D(1 + (ad || 0)), RELIC_AD_POW)), D(m));
+}
+function relicBreakGem(ad, k){
+  const m = RELIC_Q_MUL[Math.max(0, Math.min(RELIC_Q_MUL.length - 1, relicQ(k)))];
+  return dmul(dmul(D(5000), dpow(D(1 + (ad || 0)), RELIC_AD_POW)), D(m));
+}
+/* 大数费用扣减：费用在双精度安全整数内才按 Number 精确扣；超出则玩家不可能持有这么多，
+   直接返回 false（避免 Number 减法丢失精度导致「扣了但没扣够」）。 */
+function payCost(key, costD){
+  const v = dNum(costD);
+  if(!isFinite(v) || v > Number.MAX_SAFE_INTEGER) return false;
+  const cur = S[key] || 0;
+  if(cur < v) return false;
+  S[key] = cur - v;
+  return true;
+}
+/* 大数费用是否足够（避免 Number 直接比较时 1e40 与 Infinity/大数对象行为不一致） */
+function canPay(key, costD){ return dcmp(D(S[key] || 0), costD) >= 0; }
+/* 遗物效果 = 基础 × (1 + 20%×升级等级) × (1 + COEF×突破次数)
+   2.07：原「2^突破次数」为指数，突破 29 次即 ×5.4e8，是后期数值失控的主因之一，改为线性。 */
+function relicVal(k){
+  if(!S.relics || !S.relics[k]) return 0;
+  const r = RELICS.find(function(x){ return x.k === k; });
+  if(!r) return 0;
+  return Math.round(r.v * (1 + 0.20 * relicLv(k)) * (1 + relicAdCoef(r.c) * relicAd(k)));
+}
+/* 遗物升级：消耗碎片，1~10 级；满 10 级后方可突破 */
+function relicLevelUp(k){
+  if(!S.relics || !S.relics[k]){ toast('尚未拥有此遗物'); return; }
+  const lv = relicLv(k), ad = relicAd(k);
+  if(lv >= RELIC_LV_MAX){ toast('已升满 ' + RELIC_LV_MAX + ' 级，请点击「突破」'); return; }
+  const need = relicFgNeed(lv + 1, ad, k);
+  if(!canPay('relicFrag', need)){ toast('遗物碎片不足（需 ' + dStr(need) + '，当前 ' + dStr(resD('relicFrag')) + '）'); return; }
+  payCost('relicFrag', need);
+  S.relicLv = S.relicLv || {}; S.relicLv[k] = lv + 1;
+  const r = RELICS.find(function(x){ return x.k === k; });
+  toast('【' + r.n + '】升至 ' + S.relicLv[k] + ' / ' + RELIC_LV_MAX + ' 级');
+  logMsg('【' + r.n + '】升级至 ' + S.relicLv[k] + '/' + RELIC_LV_MAX + ' 级，效果 ' + relicVal(k));
+  renderRelic(); render(); save();
+}
+/* 1.56 遗物一键升级：把当前碎片能支撑的等级一次升满（封顶 RELIC_LV_MAX），
+   避免后期每级都要点几百次「升级」。逐档试算累计消耗，够多少升多少。 */
+function relicLevelUpMax(k){
+  if(!S.relics || !S.relics[k]){ toast('尚未拥有此遗物'); return; }
+  const lv0 = relicLv(k), ad = relicAd(k);
+  if(lv0 >= RELIC_LV_MAX){ toast('已升满 ' + RELIC_LV_MAX + ' 级，请点击「突破」'); return; }
+  let acc = D(0), target = lv0;
+  for(let lv = lv0 + 1; lv <= RELIC_LV_MAX; lv++){
+    const need = relicFgNeed(lv, ad, k);
+    const next = dadd(acc, need);
+    if(dcmp(next, resD('relicFrag')) > 0) break;      /* 碎片不够，停在上一档 */
+    acc = next; target = lv;
+  }
+  if(target === lv0){
+    const need = relicFgNeed(lv0 + 1, ad, k);
+    toast('遗物碎片不足（需 ' + dStr(need) + '，当前 ' + dStr(resD('relicFrag')) + '）');
+    return;
+  }
+  payCost('relicFrag', acc);
+  S.relicLv = S.relicLv || {}; S.relicLv[k] = target;
+  const r = RELICS.find(function(x){ return x.k === k; });
+  toast('【' + r.n + '】一键升至 ' + target + ' / ' + RELIC_LV_MAX + ' 级（耗碎片 ' + dStr(acc) + '）');
+  logMsg('【' + r.n + '】一键升级 ' + lv0 + ' → ' + target + ' 级，耗碎片 ' + dStr(acc) + '，效果 ' + relicVal(k));
+  renderRelic(); render(); save();
+}
+/* 全部已拥有遗物一键升级（按「每级性价比」从便宜到贵依次升，尽量把碎片花在刀刃上） */
+function relicLevelUpAll(){
+  const own = RELICS.filter(function(r){ return S.relics && S.relics[r.k]; })
+                    .filter(function(r){ return relicLv(r.k) < RELIC_LV_MAX; });
+  if(!own.length){ toast('没有可升级的遗物'); return; }
+  let n = 0;
+  own.forEach(function(r){ const before = relicLv(r.k); relicLevelUpMax(r.k); if(relicLv(r.k) > before) n++; });
+  if(n) toast('已升级 ' + n + ' 件遗物');
+  renderRelic(); render(); save();
+}
+/* 遗物突破：需先升满 10 级；消耗大量碎片 + 大量宝石；突破后等级归零、效果翻倍 */
+function relicAdvance(k){
+  if(!S.relics || !S.relics[k]){ toast('尚未拥有此遗物'); return; }
+  const lv = relicLv(k), ad = relicAd(k);
+  if(ad >= RELIC_BREAK_MAX){ toast('已突破至化境（' + RELIC_BREAK_MAX + '/' + RELIC_BREAK_MAX + '）'); return; }
+  if(lv < RELIC_LV_MAX){ toast('需先升满 ' + RELIC_LV_MAX + ' 级（当前 ' + lv + ' 级）'); return; }
+  const fg = relicBreakFrag(ad, k), gm = relicBreakGem(ad, k);
+  if(!canPay('relicFrag', fg)){ toast('碎片不足（需 ' + dStr(fg) + '，当前 ' + dStr(resD('relicFrag')) + '）'); return; }
+  if(!canPay('gem', gm)){ toast('宝石不足（需 ' + dStr(gm) + '，当前 ' + dStr(resD('gem')) + '）'); return; }
+  /* 必须检查 payCost 返回值：费用超出 SAFE_INT 时它返回 false 而不扣费。
+     原实现忽略返回值直接推进突破次数 —— 一旦 canPay 与 payCost 的判定边界分叉
+     （前者用大数比较、后者用 Number 比较），就会出现「没扣费却成功突破」的白嫖。 */
+  if(!payCost('relicFrag', fg)){ toast('碎片扣除失败（费用超出可处理上限）'); return; }
+  if(!payCost('gem', gm)){ resAdd('relicFrag', dNum(fg)); toast('宝石扣除失败，已退还碎片'); return; }
+  S.relicAd = S.relicAd || {}; S.relicLv = S.relicLv || {};
+  S.relicAd[k] = ad + 1;
+  S.relicLv[k] = 0;                                    /* 突破后等级归零，重新累计 */
+  const r = RELICS.find(function(x){ return x.k === k; });
+  toast('【' + r.n + '】第 ' + S.relicAd[k] + ' 次突破！效果提升，等级重置');
+  logMsg('【' + r.n + '】第 ' + S.relicAd[k] + ' 次突破（效果 ×' + nStr(1 + relicAdCoef(r.c) * S.relicAd[k]) + '），碎片 -' + nStr(fg) + '，宝石 -' + nStr(gm));
+  renderRelic(); render(); save();
+}
+function craftRelic(k){
+  if(S.relics && S.relics[k]){ toast('已拥有此遗物'); return; }
+  const r = RELICS.find(function(x){ return x.k === k; });
+  const _cf = RELIC_CRAFT[Math.max(0, Math.min(RELIC_CRAFT.length - 1, (r && r.q) || 0))];
+  if(!resHas('relicFrag', _cf)){ toast('遗物碎片不足（' + _cf + ' 个合成）'); return; }
+  resPay('relicFrag', _cf);
+  S.relics = S.relics || {}; S.relics[k] = true;
+  toast('合成【' + r.n + '】！' + r.d);
+  logMsg('合成遗物【' + r.n + '】：' + r.d);
+  renderRelic(); render(); save();
+}
+function openRelic(){
+  renderRelic(); $('relicOverlay').classList.add('show');
+}
+function closeRelic(){ $('relicOverlay').classList.remove('show'); }
+let relicQTab = 'all';
+function switchRelicQ(q){
+  relicQTab = (q === 'all') ? 'all' : Number(q);
+  renderQTabs('rlQTabs', relicQTab, 'switchRelicQ'); renderRelic();
+}
+function renderRelic(){
+  $('rlFrag').textContent = dStr(resD('relicFrag'));
+  renderQTabs('rlQTabs', relicQTab, 'switchRelicQ');
+  const body = $('rlBody'); if(!body) return;
+  let h = stepBar('relic', renderRelic, '点一次按此档位升级')
+          + '<div class="set-btns" style="margin-bottom:8px">' +
+          '<button onclick="relicLevelUpAll()">一键升级全部</button>' +
+          '</div>';
+  h += '<div class="tw-desc">开碎片 / 宝石，有机会掉灵宠 / 功法 / 宝物。已拥有：' +
+          Object.keys(S.relics||{}).filter(function(k){ return S.relics[k]; }).length + ' / ' + RELICS.length + '</div>';
+  /* 1.81：按「攻伐 / 毒道 / 产出」分类显示，并在卡片上标品阶 —— 遗物数量上来后一长条很难找 */
+  const _oneRelic = function(r){
+    const own = !!(S.relics && S.relics[r.k]);
+    const q = (r.q || 0), qn = RELIC_Q[q], qc = RELIC_QC[q];
+    if(!own){
+      const cf = RELIC_CRAFT[Math.max(0, Math.min(RELIC_CRAFT.length - 1, q))];
+      const can = resHas('relicFrag', cf);
+      return '<div class="wp-card q-T">' +
+           '<div class="wp-nm"><b>' + r.n + '<span class="q-gem" style="color:' + qc + '">' + qn + '</span></b><div>' + r.d + '</div></div>' +
+           '<button class="wp-up' + (can ? '' : ' off') + '" onclick="craftRelic(\'' + r.k + '\')">合成 ' + nStr(cf) + '</button>' +
+           '</div>';
+    }
+    const ad = relicAd(r.k), lv = relicLv(r.k), done = ad >= RELIC_BREAK_MAX;
+    const need = relicFgNeed(lv + 1, ad, r.k);                       /* 下一级碎片（含品阶系数） */
+    const bFg = relicBreakFrag(ad, r.k), bGm = relicBreakGem(ad, r.k); /* 突破消耗（含品阶系数） */
+    const canUp = lv < RELIC_LV_MAX && canPay('relicFrag', need);
+    const canAd = lv >= RELIC_LV_MAX && !done && canPay('relicFrag', bFg) && canPay('gem', bGm);
+    const pct = lv >= RELIC_LV_MAX ? 100 : Math.round(lv / RELIC_LV_MAX * 100);
+    return '<div class="wp-card q-S">' +   /* 1.95：原为 h += ...，函数返回 undefined，forEach 里 h += 拼出字面 "undefined" */
+         '<div class="wp-nm"><b>' + r.n + '<span class="q-gem" style="color:' + qc + '">' + qn + '</span>'
+         + '<span class="q-gem">突破 ' + ad + ' / ' + RELIC_BREAK_MAX + '</span></b>' +
+         '<div>' + r.d + ' · 当前效果 <b class="rl-now">' + relicVal(r.k) + '</b>　等级 <b>' + lv + ' / ' + RELIC_LV_MAX + '</b></div>' +
+         '<div class="q-bar"><i style="width:' + pct + '%"></i></div>' +
+         (done ? '<div class="q-num">已至化境</div>'
+               : (lv >= RELIC_LV_MAX
+                  ? '<div class="q-num">突破需：碎片 ' + nStr(bFg) + ' · 宝石 ' + nStr(bGm) + '</div>'
+                  : '<div class="q-num">升级需碎片 ' + nStr(need) + '（现有 ' + dStr(resD('relicFrag')) + '）</div>')) +
+         '</div>' +
+         (done ? '<span class="wp-lv">化境</span>'
+               : (lv >= RELIC_LV_MAX
+                  ? '<button class="wp-up' + (canAd ? '' : ' off') + '" onclick="relicAdvance(\'' + r.k + '\')">突 破</button>'
+                  : '<button class="wp-up' + (canUp ? '' : ' off') + '" onclick="relicLevelUpN(\'' + r.k + '\',' + (stepIsMax('relic') ? '0' : 'stepN(\'relic\')') + ')">升级' + (stepGet('relic') === 1 ? '' : (' ' + stepTxt('relic'))) + '</button>')) +
+         '</div>';
+  };
+  RELIC_CAT.forEach(function(cat){
+    let list = RELICS.filter(function(r){ return (r.c || 'war') === cat.k; });
+    if(relicQTab !== 'all') list = list.filter(function(r){ return (r.q || 0) === relicQTab; });   /* 1.84：品质分页 */
+    if(!list.length) return;
+    const got = list.filter(function(r){ return S.relics && S.relics[r.k]; }).length;
+    h += '<div class="ish-grp">' + cat.n + '　已拥有 ' + got + ' / ' + list.length + '</div>';
+    list.forEach(function(r){ h += _oneRelic(r); });
+  });
+  body.innerHTML = h;
+}
+
+/* ==================== 灵界法宝 ====================
+   部位主属性刻意避开 攻速 / 暴击率 / 连击（三者有设计上限，不做随机放大）：
+     法器→攻击　护甲→血量　玉佩→防御　戒指→暴伤　靴履→闪避　灵印→穿透
+   品阶决定「主属性基准 + 词条条数」；强化只提主属性；洗练重掷词条；分解回灵石 + 洗练石。 */
+/* 1.80：6 件 → 9 件（正好 3×3 九宫格）。新增 头冠(命中) / 项链(灵力) / 腰带(灵石)。
+   每件配独立 SVG 图标（sv 字段），取代原来的 emoji —— emoji 在部分安卓机型会缺字形。 */
+const ARTI_SLOTS = [
+  {k:'faqi',   n:'法 器', key:'atk',   sv:'i_ar_atk'},
+  {k:'hujia',  n:'护 甲', key:'hp',    sv:'i_ar_hp'},
+  {k:'yupei',  n:'玉 佩', key:'def',   sv:'i_ar_def'},
+  {k:'jiezhi', n:'戒 指', key:'cdm',   sv:'i_ar_cdm'},
+  {k:'xuelv',  n:'靴 履', key:'dodge', sv:'i_ar_dod'},
+  {k:'lingyin',n:'灵 印', key:'pen',   sv:'i_ar_pen'},
+  {k:'touguan',n:'头 冠', key:'hit',   sv:'i_ar_hit'},
+  {k:'xianglian',n:'项 链',key:'gp',   sv:'i_ar_gp'},
+  {k:'yaodai', n:'腰 带', key:'gs',    sv:'i_ar_gs'}
+];
+function artiSvg(sd){ return sd ? ('<svg viewBox="0 0 24 24" data-fb="' + ((sd.nm||'宝').charAt(0)) + '"><use href="#' + (sd.sv || 'i_ar_atk') + '"/></svg>') : ''; }
+/* 2.16：品阶由 5 档扩为 7 档（新增 圣品 / 道品）——
+   仙品之上再无目标，后期法宝 / 符文掉落失去意义；补两档把成长线续上。
+   所有按品阶取值的数组同步扩到 7 项，合成碎片需求随之大幅提高。 */
+const ARTI_Q    = ['凡品','灵品','玄品','神品','仙品','圣品','道品'];
+const ARTI_QC   = ['#9a9a9a','#4caf50','#2196f3','#9c27b0','#ffd54a','#ff8c2b','#ff5ea8'];
+const ARTI_MAIN = [8, 18, 40, 85, 170, 340, 700];   /* 主属性基准%（随机 ±20%） */
+const ARTI_AFFN = [1, 2, 3, 3, 4, 5, 6];            /* 词条条数 */
+const ARTI_AFF_POOL = ['atk','hp','def','cdm','pen','dodge','hit','gp','gs','gu'];  /* 无 spd/crit/combo */
+const ARTI_AFF_NAME = {atk:'灵界攻击', hp:'灵界血量', def:'灵界防御', cdm:'灵界暴伤',
+                       pen:'灵界穿透', dodge:'灵界闪避', hit:'灵界命中',
+                       gp:'灵力汲取', gs:'灵石寻获', gu:'灵魂感悟'};
+const ARTI_ENH_MAX  = 1000;                     /* 1.84：强化上限 +15 → +1000 */
+const ARTI_ENH_STEP = 0.08;                    /* 每级主属性 +8% */
+const ARTI_ENH_ALL  = 0.35;                    /* 2.12：强化对「非主属性」的折算比例（全属性随强化一起涨） */
+const ARTI_PCT_UNIT = {gp:'%', gs:'%', gu:'%', cdm:'%', atk:'%', hp:'%', def:'%', pen:'%', dodge:'', hit:''};
+/* 品阶可达层数门槛：层数越高，妖王掉落的品阶上限越高 */
+const ARTI_Q_GATE = [0, 50, 150, 400, 1000, 2500, 6000];
+const ARTI_QW     = [31, 41, 18, 1.0, 0.22, 0.045, 0.009];    /* 2.18：低阶再略提、中高品质再次下调（神 −2.2 / 仙 −3 / 圣 −3.7 / 道 −4.7 倍） */
+const ARTI_QW_FALL = 0.45;                     /* 档位衰减：层数越深，低阶权重衰减越多（否则第 1200 关仍大概率掉凡品） */
+/* 合成：消耗碎片（符文）/ 洗练石（法宝）直接产出指定品阶，产物随机、强化与等级不继承。
+   掉落是运气，合成是进度 —— 2.17 起高品质掉落大幅下调，合成成为主要获取途径。
+   两套成本分开标定：各自按「分解 N 件同品阶」定价（法宝 ∝ 洗练石 100×1.8^q、符文 ∝ 碎片 2^q），
+   2.18：中高品质合成成本大幅提高（折合分解同品阶：法宝 2/3/5/10/30/100/300 件、
+   符文 20/30/45/80/180/500/1500 件），与「高品质主要靠合成获取」配套。 */
+const FUSE_SHARD_ARTI = [200, 540, 1620, 5830, 31500, 189000, 1020000];     /* 洗练石：约 2 / 3 / 5 / 10 / 30 / 100 / 300 件同品阶分解 */
+const FUSE_SHARD_RUNE = [20, 60, 180, 640, 2880, 16000, 96000];            /* 符文碎片：约 20 / 30 / 45 / 80 / 180 / 500 / 1500 件同品阶分解 */
+/* 1.46 高阶惩罚：品阶每高一档，权重再乘 ARTI_QW_HIGHPEN。
+   ★ 为什么需要：原公式只有「低阶衰减」FALL^(maxQ-i)，当 maxQ=4（仙品可达）时，
+     低阶被压到与高阶同量级 —— 实测仙品 10.4% / 神品 18.8%，高阶太容易出。
+     加入高阶惩罚后（0.5）：仙品 1.4% / 神品 5.1% / 玄品 11.5% / 灵品 26% / 凡品 56%。 */
+const ARTI_QW_HIGHPEN = 0.25;   /* 2.17：0.35 → 0.25，高品质再降一档（神 −5.8 倍 / 仙 −6.8 倍 / 圣 −13.7 倍 / 道 −23 倍） */
+function artiData(){
+  if(!S.lmgArti) S.lmgArti = {equip:{}, bag:[], stone:0, seq:0};
+  const d = S.lmgArti;
+  if(!d.equip) d.equip = {};
+  if(!d.bag) d.bag = [];
+  d.stone = Math.max(0, d.stone || 0);
+  d.seq = d.seq || 0;
+  return d;
+}
+function artiSlotDef(k){ for(let i=0;i<ARTI_SLOTS.length;i++) if(ARTI_SLOTS[i].k===k) return ARTI_SLOTS[i]; return null; }
+function artiMaxQ(lv){
+  let q = 0;
+  for(let i = 0; i < ARTI_Q_GATE.length; i++) if((lv||1) >= ARTI_Q_GATE[i]) q = i;
+  return q;
+}
+function artiRndQ(maxQ){
+  let tot = 0;
+  const w = [];
+  for(let i = 0; i <= maxQ; i++){
+    /* 距当前可达上限越远的低阶，权重按 ARTI_QW_FALL^档位差 衰减；
+       再叠加「高阶惩罚」HIGHPEN^品阶，使高品质掉落率显著低于原设计。 */
+    w[i] = ARTI_QW[i] * Math.pow(ARTI_QW_FALL, maxQ - i) * Math.pow(ARTI_QW_HIGHPEN, i);
+    tot += w[i];
+  }
+  let r = Math.random() * tot;
+  for(let i = 0; i <= maxQ; i++){ r -= w[i]; if(r <= 0) return i; }
+  return 0;
+}
+function artiRollAffix(q, main){
+  const n = ARTI_AFFN[q] || 1, aff = [], used = {};
+  for(let i = 0; i < n; i++){
+    let k = ARTI_AFF_POOL[Math.floor(Math.random() * ARTI_AFF_POOL.length)];
+    let guard = 0;
+    while(used[k] && guard < 20){ k = ARTI_AFF_POOL[Math.floor(Math.random() * ARTI_AFF_POOL.length)]; guard++; }
+    used[k] = 1;
+    const v = Math.round(main * (0.30 + Math.random() * 0.30) * 10) / 10;   /* 主属性的 30%~60% */
+    aff.push({k:k, v:Math.max(0.5, v)});
+  }
+  return aff;
+}
+/* 掉一件法宝：层数决定品阶上限 */
+function artiMake(lv){
+  return artiMakeByQ(artiMaxQ(lv || 1));
+}
+/* 按「品阶上限」造一件（心魔按成功次数决定品阶，与主线层数无关） */
+function artiMakeByQ(maxQ){
+  const d = artiData();
+  const slot = ARTI_SLOTS[Math.floor(Math.random() * ARTI_SLOTS.length)];
+  const q = artiRndQ(Math.max(0, Math.min(ARTI_Q.length - 1, maxQ)));
+  const minQ = pickAutoQ('arti');
+  if(minQ >= 0 && q < minQ){                    /* 低于设定品阶：就地分解成强化石 */
+    const g = artiMeltVal(q, 0);
+    d.stone = Math.min(SAFE_INT, (d.stone || 0) + g.shards);
+    S.lmgStone = Math.min((S.lmgStone || 0) + g.stone, SAFE_INT);
+    toast('低于设定品阶，已自动分解：强化石 +' + g.shards);
+    return null;
+  }
+  if(d.bag.length >= PICK_MAX){
+    toast('法宝背包已满（' + PICK_MAX + ' 件），无法拾取');
+    return null;
+  }
+  const main = Math.round(ARTI_MAIN[q] * (0.8 + Math.random() * 0.4) * 10) / 10;
+  const it = {id:++d.seq, slot:slot.k, q:q, main:main, enh:0, aff:artiRollAffix(q, main)};
+  d.bag.push(it);
+  return it;
+}
+/* 分解收益（供自动分解与手动分解共用，避免两处各写一份） */
+function artiMeltVal(q, enh){
+  return {
+    stone:  Math.floor(100 * Math.pow(1.8, q) * (1 + (enh || 0) * 0.5)),
+    shards: Math.max(1, q + Math.floor((enh || 0) / 5))
+  };
+}
+/* ══════ 法宝合成（消耗洗练石）═════
+   直接用洗练石产出指定品阶，产物随机生成、强化归零。
+   刻意不继承强化：否则先强化再合等于按比例返还强化成本，强化系统的消耗意义会被削弱。 */
+function artiMakeFixedQ(q){
+  const d = artiData();
+  const slot = ARTI_SLOTS[Math.floor(Math.random() * ARTI_SLOTS.length)];
+  const main = Math.round(ARTI_MAIN[q] * (0.8 + Math.random() * 0.4) * 10) / 10;
+  const it = {id:++d.seq, slot:slot.k, q:q, main:main, enh:0, aff:artiRollAffix(q, main)};
+  d.bag.push(it);
+  return it;
+}
+/* 当前可用的洗练石（合成与洗练共用同一资源） */
+function artiShard(){ return Math.max(0, artiData().stone || 0); }
+function artiFuseCost(q){ return FUSE_SHARD_ARTI[Math.max(0, Math.min(FUSE_SHARD_ARTI.length - 1, q || 0))]; }
+function artiFuse(q, n){
+  const d = artiData();
+  n = Math.max(1, n || 1);
+  const cost = artiFuseCost(q) * n;
+  if(artiShard() < cost){ toast('洗练石不足（需 ' + nStr(cost) + '）'); return false; }
+  if(d.bag.length + n > PICK_MAX){ toast('背包空间不足（' + PICK_MAX + ' 件）'); return false; }
+  d.stone = Math.max(0, (d.stone || 0) - cost);
+  let nm = '';
+  for(let i = 0; i < n; i++){ const it = artiMakeFixedQ(q); if(!nm) nm = artiName(it); }
+  toast('合成 ' + ARTI_Q[q] + '·' + nm + (n > 1 ? (' ×' + n) : ''));
+  logMsg('洗练石合成法宝：' + ARTI_Q[q] + ' ×' + n + '（耗 ' + nStr(cost) + '）');
+  renderArti(); renderNow(true); save();
+  return true;
+}
+function artiById(id){
+  const d = artiData();
+  for(let i = 0; i < d.bag.length; i++) if(d.bag[i].id === id) return d.bag[i];
+  return null;
+}
+function artiEquipped(k){
+  const d = artiData(), id = d.equip[k];
+  return id ? artiById(id) : null;
+}
+/* 单件对某属性的加成：主属性 ×(1+强化) + 词条 */
+function artiItemVal(it, key){
+  if(!it) return 0;
+  let v = 0;
+  const sd = artiSlotDef(it.slot);
+  const enh = (it.enh || 0) * ARTI_ENH_STEP;
+  let isMain = false, hasAff = false;
+  if(sd && sd.key === key){ v += it.main * (1 + enh); isMain = true; }
+  (it.aff || []).forEach(function(a){
+    if(a.k === key){ v += a.v * (1 + enh * 0.5); hasAff = true; }   /* 强化对词条只给半额 */
+  });
+  /* 2.12：强化对「所有属性」生效 —— 非本槽主属性、又非词条的其余属性，
+     按主属性基准 × ARTI_ENH_ALL 折算，强化越高涨得越多（不再只有主属性动）。 */
+  if(!isMain && !hasAff && enh > 0) v += it.main * ARTI_ENH_ALL * enh;
+  return v;
+}
+function artiPct(key){
+  if(!key) return 0;
+  const d = artiData();
+  let v = 0;
+  ARTI_SLOTS.forEach(function(sd){
+    const it = artiEquipped(sd.k);
+    if(it) v += artiItemVal(it, key);
+  });
+  return v * ARTI_PCT_NERF;   /* 1.68：法宝专属削弱（可单独调，取代全局系数） */
+}
+/* 1.81：强化 / 洗练消耗「按品阶拉开」。
+   原强化系数 (1+q×0.8) 在仙品只有 ×4.2，而仙品主属性基准是凡品的 21 倍（ARTI_MAIN）——
+   高品质同样便宜，等于把最强档白送。现改为 ×1/2.5/6/15/40，与品阶强度梯度对齐。 */
+const ARTI_Q_COSTMUL = [1, 2.5, 6, 15, 40, 110, 300];
+function artiEnhCost(it){
+  const m = ARTI_Q_COSTMUL[Math.max(0, Math.min(ARTI_Q_COSTMUL.length - 1, it.q || 0))];
+  return Math.floor(artiEnhCostAt(it.enh || 0) * m);
+}
+/* 1.84：上限放开到 +1000，原 1.35^lv 在 lv=1000 早已突破 SAFE_INT（1.35^1000 ≈ 1e130），
+   故改为分段曲线：+0~15 沿用原手感（1.35^lv），+16~100 放缓（1.12^），
+   +101 起改幂函数 (lv/100)^3 —— 既不溢出，又保持「每级更贵」的体感。
+   实测（凡品 m=1）：+15 ≈ 1.8万、+100 ≈ 2.7亿、+500 ≈ 3.4e12、+1000 ≈ 2.7e13。 */
+function artiEnhCostAt(lv){
+  lv = Math.max(0, Math.floor(lv || 0));
+  let c = 200;
+  if(lv <= 15) c = 200 * Math.pow(1.35, lv);
+  else{
+    const c15 = 200 * Math.pow(1.35, 15);
+    if(lv <= 100) c = c15 * Math.pow(1.12, lv - 15);
+    else c = c15 * Math.pow(1.12, 85) * Math.pow(lv / 100, 3);
+  }
+  return Math.min(SAFE_INT, c);
+}
+const ARTI_REROLL_COST = [1, 2, 4, 8, 16, 32, 64];      /* 洗练石：原 1+floor(q/2) 在凡/灵/玄/神/仙 只差到 3 枚，梯度几乎不存在 */
+function artiRerollCost(it){ return ARTI_REROLL_COST[Math.max(0, Math.min(ARTI_REROLL_COST.length - 1, it.q || 0))]; }
+function artiName(it){
+  const sd = artiSlotDef(it.slot);
+  return ARTI_Q[it.q] + '·' + (sd ? sd.n.replace(/\s/g,'') : '法宝');
+}
+/* 装备 / 卸下 / 强化 / 洗练 / 分解 */
+function artiEquip(id){
+  const d = artiData(), it = artiById(id);
+  if(!it) return;
+  d.equip[it.slot] = it.id;
+  toast('已装备 ' + artiName(it));
+  logMsg('装备灵界法宝【' + artiName(it) + '】');
+  renderArti(); renderNow(true); save();
+}
+/* 1.81：法宝槽操作面板（与符文槽 runeSlotSheet 同一交互范式）
+   点击已装备槽 → 列出「卸下 / 强化 / 洗练 / 分解」，不再一次点击就摘装备。 */
+function artiSlotSheet(slot){
+  const d = artiData(), sd = artiSlotDef(slot);
+  if(!sd) return;
+  const eqId = d.equip ? d.equip[slot] : undefined;
+  const it = (eqId !== undefined && eqId !== null) ? artiById(eqId) : null;
+  if(!it){
+    /* 空槽：列出可装备的同部位法宝 */
+    const free = (d.bag || []).filter(function(x){ return x.slot === slot && d.equip[slot] !== x.id; })
+                              .sort(function(a, b){ return (b.q - a.q) || (b.main - a.main); });
+    let h = '<div class="ish-nm">' + sd.n.replace(/\s/g,'') + '</div>'
+          + '<div class="ish-dim">空置，可装备 1 件' + sd.n.replace(/\s/g,'') + '</div>';
+    if(!free.length) h += '<div class="ish-line" style="margin-top:6px">背包中没有该部位的法宝。</div>';
+    else{
+      h += '<div class="ish-grp">可装备 ' + free.length + ' 件</div>';
+      free.slice(0, 14).forEach(function(x){
+        h += '<div class="ish-line" style="cursor:pointer" onclick="artiEquip(' + x.id + ');closeItemSheet()">'
+          + '<b style="color:' + ARTI_QC[x.q] + '">' + ARTI_Q[x.q] + '·' + artiName(x) + '</b>　主属性 +'
+          + (Math.round(artiItemVal(x, sd.key) * 10) / 10) + (ARTI_PCT_UNIT[sd.key] || '') + '</div>';
+      });
+    }
+    openItemSheet('法 宝', h); return;
+  }
+  const key = sd.key;
+  let aff = '';
+  const _affK = {};
+  (it.aff || []).forEach(function(a){
+    _affK[a.k] = 1;
+    aff += '<div class="ish-line">' + (ARTI_AFF_NAME[a.k] || a.k) + ' +' + a.v + (ARTI_PCT_UNIT[a.k] || '') + '</div>';
+  });
+  /* 2.16：强化对全部属性生效 —— 其余属性直接接在词条后面逐条列出（与主属性同款行），
+     不再在底部单独写一句「其余属性各 +X」的说明（玩家看不到具体是哪些属性）。 */
+  ARTI_AFF_POOL.forEach(function(k2){
+    if(k2 === key || _affK[k2]) return;
+    const _v2 = artiItemVal(it, k2);
+    if(!(_v2 > 0)) return;
+    aff += '<div class="ish-line" style="color:#8a8070">' + (ARTI_AFF_NAME[k2] || k2) + ' +'
+         + (Math.round(_v2 * 10) / 10) + (ARTI_PCT_UNIT[k2] || '') + '</div>';
+  });
+  const h = '<div class="ish-nm" style="color:' + ARTI_QC[it.q] + '">' + (it.enh > 0 ? ('+' + it.enh + ' ') : '') + artiName(it) + '</div>'
+    + '<div class="ish-dim">' + sd.n.replace(/\s/g,'') + ' · ' + ARTI_Q[it.q] + ' · 强化 +' + (it.enh || 0) + ' / ' + ARTI_ENH_MAX + '</div>'
+    + '<div class="ish-line">主属性：' + (ARTI_AFF_NAME[key] || key) + ' +'
+      + (Math.round(artiItemVal(it, key) * 10) / 10) + (ARTI_PCT_UNIT[key] || '') + '</div>'
+    + aff
+    + '<div class="ish-ops">'
+    + '<div class="fs-btn b-brown" onclick="artiDoUnequip(\'' + slot + '\')"><span>卸 下</span></div>'
+    + '<div class="fs-btn b-gold" onclick="artiDoEnh(' + it.id + ')"><span>强化 ' + nStr(artiEnhCost(it)) + '</span></div>'
+    + '<div class="fs-btn b-blue" onclick="artiDoReroll(' + it.id + ')"><span>洗练 ' + nStr(artiRerollCost(it)) + '</span></div>'
+    + '<div class="fs-btn b-red" onclick="artiDoMelt(' + it.id + ')"><span>分 解</span></div>'
+    + '</div>';
+  openItemSheet('法 宝', h);
+}
+function artiDoUnequip(slot){ artiUnequip(slot); closeItemSheet(); }
+function artiDoEnh(id){ artiEnh(id); artiSlotSheet(artiById(id) ? artiById(id).slot : ''); }
+function artiDoReroll(id){ artiReroll(id); artiSlotSheet(artiById(id) ? artiById(id).slot : ''); }
+function artiDoMelt(id){ const s0 = artiById(id) ? artiById(id).slot : ''; artiMelt(id); if(s0) artiSlotSheet(s0); else closeItemSheet(); }
+function artiUnequip(slot){
+  const d = artiData();
+  if(!d.equip[slot]) return;
+  const it = artiById(d.equip[slot]);
+  delete d.equip[slot];
+  if(it) toast('已卸下 ' + artiName(it));
+  renderArti(); renderNow(true); save();
+}
+function artiEnh(id){
+  const it = artiById(id);
+  if(!it) return;
+  if((it.enh || 0) >= ARTI_ENH_MAX){ toast('已达强化上限 +' + ARTI_ENH_MAX); return; }
+  const c = artiEnhCost(it);
+  if((S.lmgStone || 0) < c){ toast('灵石不足（需 ' + nStr(c) + '）'); return; }
+  S.lmgStone -= c; it.enh = (it.enh || 0) + 1;
+  toast(artiName(it) + ' 强化至 +' + it.enh);
+  logMsg('法宝强化：' + artiName(it) + ' → +' + it.enh + '（消耗灵石 ' + nStr(c) + '）');
+  renderArti(); renderNow(true); save();
+}
+function artiReroll(id){
+  const d = artiData(), it = artiById(id);
+  if(!it) return;
+  const c = artiRerollCost(it);
+  if((d.stone || 0) < c){ toast('洗练石不足（需 ' + c + '）'); return; }
+  d.stone -= c;
+  it.aff = artiRollAffix(it.q, it.main);
+  toast(artiName(it) + ' 洗练完成');
+  logMsg('法宝洗练：' + artiName(it) + '（消耗洗练石 ' + c + '）');
+  renderArti(); renderNow(true); save();
+}
+function artiMelt(id){
+  const d = artiData(), it = artiById(id);
+  if(!it) return;
+  if(d.equip[it.slot] === it.id) delete d.equip[it.slot];
+  const _v = artiMeltVal(it.q, it.enh || 0);
+  const stone = _v.stone, shards = _v.shards;
+  S.lmgStone = Math.min((S.lmgStone || 0) + stone, SAFE_INT);
+  d.stone = Math.min(SAFE_INT, (d.stone || 0) + shards);
+  for(let i = 0; i < d.bag.length; i++) if(d.bag[i].id === it.id){ d.bag.splice(i, 1); break; }
+  toast('分解 ' + artiName(it) + '：灵石 +' + nStr(stone) + '　洗练石 +' + shards);
+  logMsg('分解法宝【' + artiName(it) + '】：灵石 +' + nStr(stone) + '　洗练石 +' + shards);
+  renderArti(); renderNow(true); save();
+}
+
+/* ==================== 心魔试炼 ====================
+   与主线「灵界妖王」彻底分开的独立挑战：
+   · 名称：心魔（主线每 10 关那只仍叫「灵界妖王」）
+   · 属性按「挑战成功次数」成长，与主线层数完全无关 —— 主线层数可无限涨，
+     若跟着主线走，心魔会随推关无限膨胀、掉落也失控；改按自己的通关次数才是稳定节奏
+   · 进入时保存主线层数，退出 / 战败均恢复；心魔战不推进也不损失主线进度
+   · 次数无上限：能打过就一直打，每赢一次心魔更强、掉落品阶更高 */
+/* 1.43 心魔加强：底数与成长率同步提高，等效层数步长翻倍。
+   配合「法宝 / 符文掉落大幅降低」，心魔成为两者的主要稳定来源，
+   故它必须更难 —— 否则玩家刷心魔就能轻松拿满，掉落削减失去意义。 */
+/* 1.66 心魔加强：底数 ×2.25、成长 1.45→1.52 / 1.40→1.48、等效层数步长 4→7。
+   原参数下心魔偏软（胜 10 次才 33 万血、2600 攻），玩家几乎无阻力地一路刷满，
+   法宝 / 符文的掉落削减因此失去意义。现胜 10 次约 130 万血、1.3 万攻。 */
+const TRIAL_BASE_HP  = 18000, TRIAL_HP_GROW  = 1.52;  /* 心魔血量：底数 × 成长^成功次数 */
+const TRIAL_BASE_ATK = 240,   TRIAL_ATK_GROW = 1.48;  /* 心魔攻击 */
+const TRIAL_EQ_LV    = 7;                             /* 每胜 1 次，等效层数 +7（闪避/命中/穿透/减伤） */
+const TRIAL_Q_GATE   = [0, 3, 8, 15, 25, 40, 60];     /* 品阶门槛：按成功次数（2.16 起心魔改为全品阶随机，此表仅备查） */
+function lmgInTrial(){ return !!S.lmgTrial; }
+function lmgTrialWin(){ return Math.max(0, S.lmgTrialWin || 0); }
+function lmgTrialHp(){ return dmul(D(TRIAL_BASE_HP),  dpow(D(TRIAL_HP_GROW),  lmgTrialWin())); }
+function lmgTrialAtk(){ return dmul(D(TRIAL_BASE_ATK), dpow(D(TRIAL_ATK_GROW), lmgTrialWin())); }
+function lmgTrialEqLv(){ return 1 + lmgTrialWin() * TRIAL_EQ_LV; }
+/* 战斗层：心魔用等效层，主线用真实层 —— 所有按层数取属性的地方都走它 */
+function lmgBLv(){ return lmgInTrial() ? lmgTrialEqLv() : (S.lmgLevel || 1); }
+function lmgMonAtkNow(){ return lmgInTrial() ? lmgTrialAtk() : lmgMonAtkFor(S.lmgLevel || 1); }
+function lmgMonHpNow(){
+  if(lmgInTrial()) return lmgTrialHp();
+  const lv = S.lmgLevel || 1;
+  let hp = lmgMonHpFor(lv);
+  if(lmgIsBoss(lv)) hp = dmul(hp, D(LMG_BOSS_HP_MUL));
+  return hp;
+}
+function lmgTrialMaxQ(){
+  const w = lmgTrialWin();
+  let q = 0;
+  for(let i = 0; i < TRIAL_Q_GATE.length; i++) if(w >= TRIAL_Q_GATE[i]) q = i;
+  return q;
+}
+function lmgNextBossLv(){
+  const lv = S.lmgLevel || 1;
+  return Math.ceil(lv / LMG_BOSS_EVERY) * LMG_BOSS_EVERY || LMG_BOSS_EVERY;
+}
+function lmgTrialEnter(){
+  if(!S.lmgUnlocked){ toast('启灵后开启'); return; }
+  if(lmgInTrial()){ toast('已在心魔试炼中'); return; }
+  S.lmgTrialFrom = S.lmgLevel || 1;    /* 保存主线层数，退出时恢复 */
+  S.lmgTrial = true;
+  S.lmgMonMaxHp = lmgTrialHp();
+  S.lmgMonHp = S.lmgMonMaxHp;
+  S.lmgMonName = '心魔';
+  S.lmgHp = lmgAttrD('hp');
+  resetFloatBuf();
+  startLmgMon();
+  toast('心魔试炼 第 ' + (lmgTrialWin() + 1) + ' 次！');
+  logMsg('进入心魔试炼（第 ' + (lmgTrialWin() + 1) + ' 次）· 已成功 ' + lmgTrialWin() + ' 次');
+  renderNow(true); save();
+}
+function lmgTrialExit(win){
+  if(!lmgInTrial()) return;
+  S.lmgTrial = false;
+  S.lmgLevel = (S.lmgTrialFrom === undefined || S.lmgTrialFrom === null) ? (S.lmgLevel || 1) : S.lmgTrialFrom;
+  S.lmgTrialFrom = null;
+  lmgNewMon();
+  S.lmgHp = lmgAttrD('hp');
+  resetFloatBuf();
+  if(!win){ startLmgMon(); }
+  renderNow(true); save();
+}
+/* 心魔被击败：成功次数 +1 → 下一只更强 */
+function lmgTrialClear(){
+  S.lmgTrialWin = lmgTrialWin() + 1;
+  const d = artiData();
+  /* 1.56：法宝由必掉改为概率掉落（LMG_TRIAL_ARTI_RATE），洗练石仍必掉。 */
+  /* 2.16：改为「全品阶随机」—— 原按成功次数封顶，心魔刷到后期品阶必然触顶，
+     掉落变成确定性产物；随机全品阶后，高阶永远是小概率惊喜。 */
+  const it = (Math.random() < LMG_TRIAL_ARTI_RATE) ? artiMakeByQ(ARTI_Q.length - 1) : null;
+  const sh = 2 + Math.floor(lmgTrialWin() / 3);
+  d.stone = (d.stone || 0) + sh;
+  /* 心魔同样按「成功次数」决定符文品阶上限（与法宝 lmgTrialMaxQ 同口径，与主线层数无关）
+     1.65：由「每次必掉」改为概率掉落，与法宝同口径 —— 心魔不再是符文印钞机。 */
+  const _rt = (Math.random() < LMG_TRIAL_RUNE_RATE) ? runeMakeByQ(RUNE_Q.length - 1) : null;
+  /* 1.48：成就「心魔通关」→ 心魔奖励 +15%/阶段（线性作用于灵力与灵石） */
+  const _xmMul = 1 + achXmPct() / 100;
+  S.lmgPower = dadd(_toD(S.lmgPower || D(0)), dmul(D(200 * _xmMul), dpow(D(1.18), lmgTrialWin())));
+  S.lmgStone = Math.min((S.lmgStone || 0) + Math.floor(500 * _xmMul * Math.pow(1.16, lmgTrialWin())), SAFE_INT);
+  const _artiTxt = it ? ('　' + artiName(it)) : '';
+  toast('心魔伏诛！第 ' + lmgTrialWin() + ' 次成功' + _artiTxt + '　洗练石 ×' + sh);
+  logMsg('心魔试炼第 ' + lmgTrialWin() + ' 次成功：获得' + (it ? '【' + artiName(it) + '】' : '洗练石') + ' ×' + sh + '（下一只更强）');
+  if(_rt) logMsg('心魔掉落符文：【' + RUNE_Q[_rt.q] + '·' + runeKindDef(_rt.k).n + '】');
+  /* 立即刷新下一只心魔（不退出、不推进主线） */
+  S.lmgMonMaxHp = lmgTrialHp();
+  S.lmgMonHp = S.lmgMonMaxHp;
+  const mx = lmgAttrD('hp');
+  S.lmgHp = dmin(mx, dadd(_toD(S.lmgHp || D(0)), dmul(mx, D(0.35))));
+  renderNow(true); save();
+}
+
+/* ==================== 灵界训练洞府 ====================
+   模型：多产线独立投资。洞府自带货币「洞府灵玉」，由洞府自己产出，
+   升级只花灵玉 —— 与灵石 / 灵力分隔，形成「洞府赚钱 → 投回洞府 → 赚更多」的闭环，
+   不会因为洞府而挤占灵界主线养成。
+   成本指数 ×1.15/级、产出线性 +基准/级：存在净收益最优停点，不是无脑点到底，
+   但也刻意不做硬上限，想无限投就无限投（等级无上限）。 */
+const CAVE_LINES = [
+  /* —— 灵玉产线：用洞府灵玉升级、产出洞府灵玉本身 ——
+     原灵玉只由「总等级 ×0.25」被动产出，开局 0.6/时 极慢，第一条产线都要攒很久。
+     此产线让灵玉成为一条可主动投资的增长线，形成「投灵玉 → 产更多灵玉」的加速循环。
+     成本仍是 10 × 1.15^等级（指数）而产出线性，故存在最优停点，不会失控。 */
+  /* 1.64：各产线 base 累计上调 50 倍（1.56 只上调 50%，洞府依旧「点满就忘」） */
+  {k:'jade',  n:'灵　玉', ic:'◍', base:112.5, unit:'/时'},
+  {k:'power', n:'灵力',   ic:'✦', base:225,   unit:'/时'},
+  {k:'stone', n:'灵石',   ic:'◈', base:150,   unit:'/时'},
+  {k:'soul',  n:'灵魂',   ic:'✧', base:112.5, unit:'/时'},
+  {k:'pexp',  n:'灵兽经验', ic:'❋', base:3000, unit:'/时'},
+  {k:'plexp', n:'主角经验', ic:'✵', base:2250, unit:'/时'},
+  /* —— 凡人产线：不直接产资源，而是每小时掷骰掉「凡人界物品」——
+     命中后用凡尘宝箱同一套池（越珍贵概率越低），已拥有则走重复突破。
+     概率刻意远低于开宝箱（每级仅 +0.004%/时），属于长线添头，不冲击宝箱经济。 */
+  {k:'neili', n:'内　力',   ic:'❂', base:600,  unit:'/时'},
+  {k:'gem',   n:'宝　石',   ic:'◈', base:400,  unit:'/时'},
+  {k:'pts',   n:'转生点',   ic:'✥', base:12,   unit:'/时'},
+  /* —— 灵脉产线：直接产「灵脉」系统的养成资源（矿石 / 灵蕴），用洞府灵玉升级。
+     灵脉本身靠占领矿脉产出，此产线是额外的稳定补充，不与矿脉争夺 ——
+     即使一处矿都没占到，灵脉节点也有缓慢的成长来源。 */
+  {k:'ore',   n:'凡脉·矿石', ic:'◆', base:60,  unit:'/时'},
+  {k:'ly',    n:'灵脉·灵蕴', ic:'◇', base:40,  unit:'/时'}
+];
+const CAVE_RARE_KIND = {tre:'tre', pet:'pet', gf:'gf'};
+/* 凡人产线掷骰：返回命中的物品（未命中返回 null） */
+function caveRareRoll(kind, pPerHour, hrs){
+  if(!(pPerHour > 0) || !(hrs > 0)) return null;
+  const p = Math.min(0.9, pPerHour / 100 * hrs);      /* base 是「%/时」 */
+  if(Math.random() >= p) return null;
+  const pool = boxRarePool().filter(function(x){ return x.K.kind === kind; });
+  if(!pool.length) return null;
+  let tot = 0; pool.forEach(function(x){ tot += x.p; });
+  if(!(tot > 0)) return null;
+  let r = Math.random() * tot;
+  for(let i = 0; i < pool.length; i++){ r -= pool[i].p; if(r <= 0) return pool[i]; }
+  return pool[pool.length - 1];
+}
+const CAVE_COST_BASE = 8, CAVE_COST_GROW = 1.12;   /* 1.64：10×1.15^lv → 8×1.12^lv，升级更便宜、能推更高等级 */
+function caveData(){
+  if(!S.lmgCave) S.lmgCave = {lv:{}, jade:0, acc:0};
+  const d = S.lmgCave;
+  if(!d.lv) d.lv = {};
+  d.jade = Math.max(0, d.jade || 0);
+  return d;
+}
+function caveLv(k){ const d = caveData(); return Math.max(0, d.lv[k] || 0); }
+function caveLineDef(k){ for(let i=0;i<CAVE_LINES.length;i++) if(CAVE_LINES[i].k===k) return CAVE_LINES[i]; return null; }
+/* 某产线每小时产出（未含全局加成） */
+/* 1.56 洞府加强：
+   原产出 = base × 等级，纯线性 —— 前期尚可，中后期相对灵界资源消耗量几乎可忽略，
+   洞府沦为「点满就忘」的摆设。改为 base × 等级 × 等级成长系数，
+   并上调各产线 base，让洞府重新成为一条值得持续投资的线。
+   CAVE_LV_BOOST 越小成长越快：默认 30，即每满 30 级该产线产出翻倍。 */
+const CAVE_LV_BOOST = 15;   /* 1.64：30 → 15，每满 15 级产出翻倍（成长更快） */
+function caveLinePH(k){
+  const d = caveLineDef(k);
+  if(!d) return 0;
+  const lv = caveLv(k);
+  return d.base * lv * (1 + lv / CAVE_LV_BOOST);
+}
+/* 灵玉产出：只与「洞府总等级」挂钩，与各产线分配无关 —— 投入越多，赚钱越快 */
+function caveTotalLv(){ let t = 0; CAVE_LINES.forEach(function(l){ t += caveLv(l.k); }); return t; }
+/* 灵玉产出 = 保底（0.6 + 洞府总等级 ×0.25）+ 灵玉产线产出。
+   注：caveTotalLv() 已含灵玉产线自身等级，故该产线每级实际贡献 = base(1.0) + 0.25。 */
+function caveJadePH(){ return 30 + caveTotalLv() * 8 + caveLinePH('jade'); }   /* 1.64：保底 1.2→30，总等级系数 0.5→8 */
+function caveUpCost(k){
+  const lv = caveLv(k);
+  if(lv === 0) return 0;                            /* 第一条产线免费：给洞府一个零门槛起点 */
+  return Math.floor(CAVE_COST_BASE * Math.pow(CAVE_COST_GROW, lv - 1));   /* 首级免费后，成本从第 2 级起算 */
+}
+function caveUp(k){
+  const d = caveData(), c = caveUpCost(k);
+  if((d.jade || 0) < c){ toast('洞府灵玉不足（需 ' + nStr(c) + '）'); return false; }
+  d.jade -= c;
+  d.lv[k] = caveLv(k) + 1;
+  toast((caveLineDef(k) || {}).n + '产线 → Lv.' + d.lv[k]);
+  logMsg('洞府升级：【' + (caveLineDef(k) || {}).n + '】产线 Lv.' + d.lv[k] + '（消耗洞府灵玉 ' + nStr(c) + '）');
+  renderCave(); save();
+  return true;
+}
+/* 洞府总览：每小时各项产出 */
+function caveGainPH(){
+  const g = {};
+  CAVE_LINES.forEach(function(l){ g[l.k] = caveLinePH(l.k); });
+  g.jade = caveJadePH();
+  return g;
+}
+/* 结算 hrs 小时产出（在线 / 离线共用）。sec 用于小数累计，避免短间隔被抹成 0 */
+function caveApply(hrs){
+  if(!S.lmgUnlocked) return null;
+  if(!(hrs > 0)) return null;
+  const g = caveGainPH();
+  /* 不能因为「所有产线都是 0 级」就直接 return null：
+     洞府灵玉有 0.6/时 的保底产率（不依赖产线等级），若此时不结算，
+     玩家永远攒不到第一笔灵玉、也就永远升不了第一条产线 —— 洞府开局即死锁。
+     判据改为：灵玉与产线全为 0 才算无产出。 */
+  if(!(g.jade > 0) && !CAVE_LINES.some(function(l){ return g[l.k] > 0; })) return null;   /* 凡人产线 base 即产率，同样 >0 */
+  const d = caveData();
+  const r = {jade:0, power:0, stone:0, soul:0, pexp:D(0), plexp:D(0), neili:0, gem:0, pts:D(0)};
+  /* 灵玉：允许小数累积（d.acc），否则低级洞府每小时 0.6 玉会被 Math.floor 抹成 0 */
+  const jadeRaw = (d.acc || 0) + g.jade * hrs;      /* 只累计零头 + 本次新增，d.jade 已是整数部分 */
+  r.jade = Math.floor(jadeRaw);
+  d.acc = jadeRaw - r.jade;
+  d.jade = (d.jade || 0) + r.jade;
+  r.power = Math.floor(g.power * hrs);
+  if(r.power > 0) S.lmgPower = dadd(_toD(S.lmgPower || D(0)), D(r.power));
+  r.stone = Math.floor(g.stone * hrs);
+  if(r.stone > 0) S.lmgStone = Math.min((S.lmgStone || 0) + r.stone, SAFE_INT);
+  r.soul = Math.floor(g.soul * hrs);
+  if(r.soul > 0){
+    /* 灵魂是普通 Number（上限 SAFE_INT），绝不能走 dadd/_toD —— 写进去就变成大数对象，
+       之后所有「(S.soul||0) + n」退化成字符串拼接，再被 capRes 的 !isFinite 清成 0。
+       统一走 capRes('soul', 普通数字加法)。 */
+    resAdd('soul', soulGain(r.soul));
+    r.soul = Math.floor(r.soul);
+  }
+  if(g.pexp > 0){
+    r.pexp = dmul(D(g.pexp), D(hrs));
+    S.lmgPetExp = dadd(petExpPool(), r.pexp);
+  }
+  if(g.plexp > 0){
+    r.plexp = dmul(D(g.plexp), D(hrs));
+    plvAddExp(r.plexp);
+  }
+  /* 灵脉产线：矿石 / 灵蕴 —— 进灵脉系统资源（与矿脉占领产出同源、同上限） */
+  r.ore = Math.floor((g.ore || 0) * hrs);
+  r.ly  = Math.floor((g.ly  || 0) * hrs);
+  if(r.ore > 0 || r.ly > 0){
+    const m = maiData();
+    if(r.ore > 0) m.ore = Math.min(SAFE_INT, (m.ore || 0) + r.ore);
+    if(r.ly  > 0) m.ly  = Math.min(SAFE_INT, (m.ly  || 0) + r.ly);
+  }
+  /* 内力 / 宝石 / 转生点 产线：直接进对应资源（内力、转生点为大数，宝石为普通数字） */
+  r.neili = Math.floor((g.neili || 0) * hrs);
+  if(r.neili > 0) nlAdd(r.neili);
+  r.gem = Math.floor((g.gem || 0) * hrs);
+  if(r.gem > 0) resAdd('gem', r.gem);
+  if(g.pts > 0){
+    r.pts = dmul(D(g.pts), D(hrs));
+    /* S.pts 本身即大数对象，不能再用 D() 包一层（否则 dmul/dadd 拿到的是包装后的错误结构，
+       表现为「结算有产出但转生点不涨」）。写法与凡人塔通关 S.pts = dadd(S.pts || D(0), gain) 一致。 */
+    S.pts = dadd(S.pts || D(0), r.pts);
+  }
+  /* 原「凡人产线」（掷骰掉宝物 / 宠物 / 功法）已移除，改为上述三条资源产线 */
+  CAVE_LINES.forEach(function(l){
+    if(!l.rare) return;
+    const hit = caveRareRoll(l.rare, g[l.k], hrs);
+    if(!hit) return;
+    if(hit.up){
+      hit.lv = dupUp(hit.K.kind, hit.it.k);
+      toast('洞府产出：' + hit.K.n + '【' + hit.it.n + '】突破至 ' + hit.lv + ' 重');
+      logMsg('训练洞府产出：' + hit.K.n + '【' + hit.it.n + '】突破至 ' + hit.lv + ' 重');
+    }else{
+      hit.K.get(hit.it.k);
+      toast('洞府产出：' + hit.K.n + '【' + hit.it.n + '】');
+      logMsg('训练洞府产出：' + hit.K.n + '【' + hit.it.n + '】');
+    }
+    r.rare = (r.rare || 0) + 1;
+  });
+  return r;
+}
+
+/* ============ 凡尘宝箱 ============ */
+const BOX_ALL_MAX = 2e5;            /* 「全部开启」单次上限：防止极端数量（百万级）卡死主线程 */
+/* 凡尘宝箱常规掉落三档：丹药 / 遗物碎片 / 宝石，概率互斥且必须首尾相接（宝石为兜底 else）。
+   2.18：丹药由 14% 提到 18%（枚数 1~2 → 1~3），碎片档同步右移以保持宝石 60% 不变。 */
+const BOX_PILL_P = 0.18;
+const BOX_FRAG_P = 0.22;
+/* ============ 凡尘宝箱 · 稀有掉落（灵宠 / 功法 / 宝物） ============
+   设计：每开 1 个宝箱独立掷骰，命中率极低；命中后再按「珍贵度权重」挑一件尚未拥有的。
+   · 权重按售价分 6 档，越贵权重越低（每档约 ×0.18），最贵与最便宜相差数千倍
+   · 已拥有的不再进池 → 不会重复掉落，且随着收集变全，剩下的都是珍贵的，出货越来越难
+   · 1.81：不再有任何保底 —— 纯权重抽取，开多少箱都可能不出（越珍贵越难得） */
+const BOX_RARE_P = 0.0005;                           /* 档位基准（各件概率 = 档位基准 × 类别系数，见 BOX_RARE_PT） */
+/* 1.81：凡人宝箱稀有掉落保底 —— 已彻底移除（用户要求）。
+   此前 1.59 加过「软保底（连开未出 800 箱后每 800 箱 +40%，上限 ×6）+ 硬保底（12000 箱必出）」。
+   现全部删除：稀有掉落回到纯权重抽取，越珍贵越难得，不再有「开够数就必出」的兜底。
+   S.boxPity 字段仅为兼容旧存档保留，不参与任何计算，也不再在面板显示。 */
+
+/* ============ 重复掉落 → 叠加升级 ============
+   · 已拥有的功法 / 灵宠 / 宝物仍会掉落，每重复掉 1 次「重数 +1」，效果按重数线性放大
+   · 每重 +50% 基础效果（DUP_STEP），最多 10 重（DUP_MAX），满重后不再进池
+   · 特殊属性（攻速 / 暴击率 / 连击）本身有上限，重复掉落不放大这些项 —— 只涨其余项
+     例：疾风步（纯攻速）重复掉落不再进池；破煞真言（最终伤害）可升；
+         洞玄天眸（暴击率 +40% / 暴伤 +300%）只涨暴伤，暴击率维持 40% */
+const DUP_MAX  = 10;                                 /* 每件最多 10 重 */
+const DUP_STEP = 0.5;                                /* 每重 +50% 基础效果 */
+const DUP_SKIP = {spd:1, crit:1, combo:1};           /* 特殊属性：有上限，不参与升级 */
+const DUP_KEY  = {gf:'gfLv', pet:'petLv', tre:'treLv'};
+function dupLv(kind, k){ const m = S[DUP_KEY[kind]]; return (m && m[k]) || 0; }
+function dupMul(kind, k, key){ if(DUP_SKIP[key]) return 1; return 1 + dupLv(kind, k) * DUP_STEP; }
+function dupUp(kind, k){
+  const key = DUP_KEY[kind];
+  if(!S[key]) S[key] = {};
+  const lv = Math.min(DUP_MAX, (S[key][k] || 0) + 1);
+  S[key][k] = lv;
+  return lv;
+}
+/* 该件重复掉落是否还能变强：未满重 且 至少有一项非特殊属性 */
+function itemCanUp(kind, it){
+  if(dupLv(kind, it.k) >= DUP_MAX) return false;
+  if(kind === 'gf') return !DUP_SKIP[it.key];
+  const e = (kind === 'pet') ? it.eff : it.e;
+  for(const key in e) if(!DUP_SKIP[key]) return true;
+  return false;
+}
+function dupTag(kind, k){                            /* 面板角标：仅已拥有且重数 > 0 时显示 */
+  const lv = dupLv(kind, k);
+  return lv > 0 ? '<span style="color:#ffd54a;font-size:11px"> ●' + lv + '重</span>' : '';
+}
+/* 6 档「单件」掉落概率：<1万 / <10万 / <100万 / <1000万 / <1亿 / ≥1亿
+   2.18：整体下调，且高价（高品）档削得更狠 —— 低档约 ×0.75，顶档 ×0.06，稀有物主要靠合成 / 其它途径获取 */
+const BOX_RARE_PT   = [1.5e-5, 9e-6, 1.4e-6, 1.6e-7, 2.2e-8, 2.5e-9];
+function boxRareTier(cost){
+  const c = cost || 0;
+  if(c < 1e4) return 0;  if(c < 1e5) return 1;  if(c < 1e6) return 2;
+  if(c < 1e7) return 3;  if(c < 1e8) return 4;  return 5;
+}
+const BOX_RARE_KIND = [
+  {kind:'pet', n:'灵宠', w:0.5, list:function(){ return (typeof PETS      !== 'undefined') ? PETS      : []; },
+   own:function(k){ return petBought(k); },
+   get:function(k){ if(!S.pets) S.pets = {}; S.pets[k] = true; if(S.petsOff) delete S.petsOff[k]; }},
+  {kind:'gf',  n:'功法', w:1.0, list:function(){ return (typeof GONGFA    !== 'undefined') ? GONGFA    : []; },
+   own:function(k){ return gfBought(k); },
+   get:function(k){ if(!S.gongfa) S.gongfa = {}; S.gongfa[k] = true; if(S.gongfaOff) delete S.gongfaOff[k]; }},
+  {kind:'tre', n:'宝物', w:0.8, list:function(){ return (typeof TREASURES !== 'undefined') ? TREASURES : []; },
+   own:function(k){ return treHas(k); },
+   get:function(k){ S.treasures = S.treasures || {}; S.treasures[k] = true; }}
+];
+function boxRarePool(){
+  const pool = [];
+  for(let i = 0; i < BOX_RARE_KIND.length; i++){
+    const K = BOX_RARE_KIND[i], list = K.list();
+    for(let j = 0; j < list.length; j++){
+      const it = list[j];
+      if(K.own(it.k) && !itemCanUp(K.kind, it)) continue;   /* 已拥有且不能再升级：不再进池 */
+      pool.push({K:K, it:it, up:K.own(it.k), p:BOX_RARE_PT[boxRareTier(it.cost)] * K.w});
+    }
+  }
+  pool.sort(function(a, b){ return b.p - a.p; });     /* 概率降序：展示时「最易出 / 最难出」直接取首尾 */
+  return pool;
+}
+function boxRareTotal(pool){ let t = 0; for(let i = 0; i < pool.length; i++) t += pool[i].p; return t; }   /* 本箱命中任意一件的概率 = 各件之和 */
+/* 概率文案：极小概率写成「1 / N」，否则写百分比 */
+function boxRareOdds(p){
+  if(!(p > 0)) return '—';
+  const inv = 1 / p;
+  return inv >= 10000 ? ('1 / ' + nStr(Math.round(inv))) : ((Math.round(p * 1e6) / 1e4) + '%');
+}
+
+function openBox(all){
+  if(dcmp(resD('box'), D(1)) < 0){ toast('没有凡尘宝箱'); return; }
+  /* 「全部开启」名实相符：原实现硬编码最多只开 200 个，玩家有几万个宝箱时要点到手酸，
+     且弹窗仍写「全部开启」属于功能与文案不符。
+     现一次性开完；仅当数量极端（> 单次上限）时按上限分批，并在提示里说明剩余量。 */
+  const cnt = all ? Math.min(resNum('box'), BOX_ALL_MAX) : 1;
+  let gem = 0, frag = 0;
+  const pillGot = {};
+  /* 稀有掉落：整批共用一个池（避免每箱重建，万箱级开启也不卡），抽中即出池，同批不重复 */
+  const pool = boxRarePool();
+  let poolP = boxRareTotal(pool);                     /* 随池内剩余而变：越收集越难出 */
+  const rareGot = [];
+  const bm = boxMul();                                  /* 统一用 boxMul()（含成就/宠物/经脉/宝物），原仅算成就且末尾又乘一次 boxMul 导致叠加 */
+  for(let i = 0; i < cnt; i++){
+    const r = Math.random();
+    if(r < BOX_PILL_P){                                                       /* 丹药 1~3 枚（随机种类），概率与枚数均可整体标定 */
+      const pk = PILLS[Math.floor(Math.random() * PILLS.length)].k;
+      const pn = 1 + (Math.random() < 0.50 ? 1 : 0) + (Math.random() < 0.20 ? 1 : 0);
+      pillsAdd(pk, pn);                                                                          /* 灵丹改大数累加 */
+      pillGot[pk] = (pillGot[pk] || 0) + pn;
+    }else if(r < BOX_PILL_P + BOX_FRAG_P){ frag += Math.round((2 + (Math.random() < 0.30 ? 1 : 0)) * bm * (1 + relicVal('frag') / 100)); }  /* 遗物碎片 2~3（1.81：接入「拾遗遗物」） */
+    else { gem += Math.round((6 + Math.floor(Math.random() * 13)) * bm); }                       /* 60% 宝石 6~18（原 47% / 2~8） */
+    if(pool.length){                                    /* 稀有掉落：与上面的常规掉落相互独立 */
+      /* 1.81：保底已移除 —— 命中率就是纯权重 poolP，不再随连开次数提升 */
+      const hitP = Math.min(1, poolP);
+      if(Math.random() < hitP){
+        let r2 = Math.random() * poolP, pick = pool.length - 1;
+        for(let j = 0; j < pool.length; j++){ r2 -= pool[j].p; if(r2 <= 0){ pick = j; break; } }
+        const hit = pool[pick];
+        poolP -= hit.p; pool.splice(pick, 1);           /* 出池：同批不会重复掉落同一件 */
+        if(hit.up){                                     /* 重复掉落 → 重数 +1（特殊属性不涨） */
+          hit.lv = dupUp(hit.K.kind, hit.it.k);
+          if(hit.lv >= DUP_MAX){ hit.full = true; }     /* 满重：本次之后不再进池 */
+        }else{
+          hit.K.get(hit.it.k);                          /* 首次获得：立即生效（自动启用 / 出战） */
+        }
+        rareGot.push(hit);
+        S.stRare = (S.stRare || 0) + 1;
+      }
+    }
+  }
+  /* bm 已在逐次结算中生效，此处不再重复乘 boxMul() */
+
+  /* 2.23：box 已改为大数存储，减法由 resPay 的大数层完成，不再需要「先夹到安全整数」的老防御 */
+  resPay('box', cnt);
+  resAdd('gem', gem); resAdd('relicFrag', frag);
+  S.stBox = (S.stBox || 0) + cnt;
+  let pt = '';
+  for(const k in pillGot){ pt += (pt ? '、' : '') + pillName(k) + ' ×' + pillGot[k]; }
+  const rest = resD('box');                        /* 扣减后剩余 */
+  const more = dcmp(rest, D(0)) > 0 ? ('，剩余 ' + dStr(rest) + ' 个可再点') : '';
+  let rt = '';
+  rareGot.forEach(function(h){
+    rt += (rt ? '、' : '') + h.K.n + '【' + h.it.n + '】' + (h.up ? (' 突破至 ' + h.lv + ' 重') : '');
+    logMsg('凡尘宝箱稀有掉落：' + h.K.n + '【' + h.it.n + '】' + (h.up ? (' 突破至 ' + h.lv + ' 重（效果 +' + Math.round(h.lv * DUP_STEP * 100) + '%，特殊属性不涨）') : (h.it.d ? '（' + h.it.d + '）' : '')));
+  });
+  toast('开启 ' + nStr(cnt) + ' 个宝箱：宝石 +' + nStr(gem) + '，遗物碎片 +' + nStr(frag) + (pt ? '，丹药 ' + pt : '') + (rt ? '　★稀有掉落：' + rt : '') + more);
+  /* 1.56：「已自动启用」措辞过时（启用 / 停用已废除），改为「已永久生效」 */
+  if(rt) toast('★ 稀有掉落：' + rt + '（已永久生效）');
+  logMsg('开启凡尘宝箱 ×' + nStr(cnt) + '：宝石 +' + nStr(gem) + '，遗物碎片 +' + nStr(frag) + (pt ? '，丹药 ' + pt : '') + more);
+  renderBag(); render();
+  if(rareGot.length){ try{ renderPet(); renderGongfa(); renderTreasure(); }catch(e){} }
+  save();
+}
+
+/* ============ 背包 ============ */
+let bagCat = 'seed';                       /* 背包当前分类：seed 种子 / pill 丹药 / sup 辅助 / relic 遗物 */
+function openBag(){ renderBag(); $('bagOverlay').classList.add('show'); }
+function closeBag(){ $('bagOverlay').classList.remove('show'); }
+function switchBagCat(c){
+  bagCat = c;
+  renderBagTabs();
+  renderBag();
+}
+function renderBagTabs(){
+  const t = $('bagTabs');
+  if(!t) return;
+  const defs = [
+    {c:'seed',  n:'种子'},
+    {c:'pill',  n:'丹药'},
+    {c:'sup',   n:'辅助'}
+  ];
+  let h = '';
+  defs.forEach(function(d){
+    let cnt = '';
+    if(d.c === 'seed'){ let n = 0; SEEDS.forEach(function(sd, i){ n += (S.seeds && S.seeds[i]) || 0; }); cnt = n ? ' (' + n + ')' : ''; }
+    if(d.c === 'sup'){ const n = fertTotal(); cnt = n ? ' (' + n + ')' : ''; }
+    h += '<div class="sh-tab' + (bagCat === d.c ? ' active' : '') + '" data-c="' + d.c + '" onclick="switchBagCat(\'' + d.c + '\')">' + d.n + cnt + '</div>';
+  });
+  t.innerHTML = h;
+}
+function renderBag(){
+  $('bagBox').textContent = dStr(resD('box'));
+  $('bagFrag').textContent = dStr(resD('relicFrag'));
+  $('bagGem').textContent = dStr(resD('gem'));
+  const own = Object.keys(S.relics||{}).filter(function(k){ return S.relics[k]; });
+  let sh = '', st = 0;
+  SEEDS.forEach(function(sd, i){ const c = (S.seeds && S.seeds[i]) || 0; st += c; if(c) sh += sd.n + ' ×' + c + '　'; });
+  let ph = '', pt = D(0);
+  PILLS.forEach(function(p){
+    const c = pillsD(p.k);
+    if(dcmp(c, D(0)) > 0){ pt = dadd(pt, c); ph += p.n + ' ×' + dStr(c) + '　'; }
+  });
+  let h = '';
+  renderBagTabs();
+  if(bagCat === 'seed'){
+    h += '<div class="wp-grp">种 子<i>共 ' + st + ' 颗</i></div>';
+    h += '<div class="wp-tip">' + (sh || '暂无种子（秘境 / 商店）') + '</div>';
+    SEEDS.forEach(function(sd, i){
+      const c = (S.seeds && S.seeds[i]) || 0;
+      if(!c) return;
+      h += '<div class="wp-card q-S"><div class="wp-nm"><b>' + sd.n + '</b><div>成熟 ' + fmtDur(sd.t) +
+           ' · 宝石 ' + nStr(farmGemOut(i)) + ' · 随机丹药 ×' + farmPillOut(i) + '</div></div>' +
+           '<div class="wp-lv">×' + c + '</div></div>';
+    });
+  }else if(bagCat === 'pill'){
+    h += '<div class="wp-grp">灵 丹<i>共 ' + dStr(pt) + ' 枚</i></div>';
+    PILLS.forEach(function(p){
+      const hv = pillsD(p.k), has = dcmp(hv, D(0)) > 0;
+      h += '<div class="wp-card q-S"><div class="wp-nm"><b>' + p.n +
+           '<span style="margin-left:6px;color:#f0c765;font-size:11px">已服 ' + pillN(p.k) + ' 枚</span></b><div>' + p.d +
+           '</div></div><div class="wp-lv">×' + nStr(hv) + '</div>' +
+           '<button class="wp-up' + (has ? '' : ' off') + '" onclick="usePill(\'' + p.k + '\')">服用</button></div>';
+    });
+  }else if(bagCat === 'sup'){
+    h += '<div class="wp-grp">辅 助<i>化肥共 ' + fertTotal() + ' 份</i></div>';
+    h += '<div class="wp-tip" style="text-align:left;line-height:1.7">缩短<b style="color:#7fd0ff">所有已播种地块</b>成熟时间，' +
+         '秘境掉落，品质越高越难得。</div>';
+    FERT.forEach(function(f){
+      const c = fertN(f.k);
+      h += '<div class="wp-card q-S"><div class="wp-nm"><b>' + f.n +
+           '</b><div>' + f.d + '</div></div><div class="wp-lv">×' + c + '</div>' +
+           '<button class="wp-up' + (c ? '' : ' off') + '" onclick="useFert(\'' + f.k + '\')">使用</button>' +
+           (c > 1 ? '<button class="wp-up" onclick="fertUseAll(\'' + f.k + '\')">全用</button>' : '') + '</div>';
+    });
+  }
+  $('bagRelics').innerHTML = h;
+  const rb = $('bagRareTip');
+  if(rb){
+    const p2 = boxRarePool(), tw = boxRareTotal(p2);
+    if(!p2.length){
+      rb.innerHTML = '稀有掉落：<span style="color:#7ee0a0">灵宠 / 功法 / 宝物已全部集齐且满 ' + DUP_MAX + ' 重</span>（累计稀有掉落 ' + nStr(S.stRare || 0) + ' 件）';
+    }else{
+      const hi = p2[0], lo = p2[p2.length - 1];
+      /* 1.81：不再展示任何命中几率，也不再提保底（已移除）—— 只讲机制与剩余数量 */
+      /* 1.82：底部文案精简 —— 不再展示「较易出 / 最难出 / 池中剩余」等概率与库存暗示 */
+      rb.innerHTML = '每箱均有可能掉落 <b style="color:#ffd54a">灵宠 / 功法 / 宝物</b>，越珍贵越难得'
+        + '<br>重复掉落 → <b style="color:#ffd54a">突破 +1 重</b>（每重 +' + Math.round(DUP_STEP * 100) + '%，上限 ' + DUP_MAX + ' 重）'
+        + '<br>累计稀有掉落 ' + nStr(S.stRare || 0) + ' 件';
+    }
+  }
+}

@@ -1,0 +1,2075 @@
+/* ==================== 灵脉系统 1.49 ====================
+   结构：占领矿脉 → 产矿石/灵蕴 → 升级世界图节点 → 掉落与战力加成
+   节点层：小节点（无上限，成本递增） + 大节点（无上限，等级 = 绑定小节点 ÷ 10，凡/灵配对）
+   矿脉层：每日随机刷新，品质与等级随机（越高越稀有），守卫越强，产出越高
+   ======================================================== */
+
+/* ---------- 小节点：无上限，成本递增 ----------
+   凡人界：走加法池，数值被大量既有加成稀释，故给得多也不影响平衡。
+   灵界：每级 +10%（用户指定），是灵界战力的长期成长线。
+   ★ 每个小节点与一个大节点一一绑定（见 MAI_BIG 的 sf / sl）：
+     小节点每升 10 级，对应大节点方可升 1 级 —— 必须先堆小节点。 */
+const MAI_SMALL = {
+  /* 1.96：小节点每级加成 ×0.6（用户要求削弱），同步把成长重心移到大节点。 */
+  fr: [
+    {k:'atk',  n:'凡·攻击', per:60,  d:'凡人界攻击 +60%/级'},
+    {k:'hp',   n:'凡·血量', per:60,  d:'凡人界血量 +60%/级'},
+    {k:'crit', n:'凡·暴击', per:6,   d:'凡人界暴击率 +6%/级'},
+    {k:'cdm',  n:'凡·暴伤', per:60,  d:'凡人界暴击伤害 +60%/级'},
+    {k:'fdm',  n:'凡·终伤', per:36,  d:'凡人界最终伤害 +36%/级'},
+    {k:'psn',  n:'凡·毒伤', per:24,  d:'凡人界毒伤倍率 +24%/级'},
+    {k:'ign',  n:'凡·破防', per:3.6, d:'凡人界破防 +3.6%/级'}
+  ],
+  lmg: [
+    {k:'atk',  n:'灵·攻击', per:13,  d:'灵界攻击 +13%/级'},
+    {k:'hp',   n:'灵·血量', per:13,  d:'灵界血量 +13%/级'},
+    {k:'def',  n:'灵·防御', per:13,  d:'灵界防御 +13%/级'},
+    {k:'hit',  n:'灵·命中', per:13,  d:'灵界命中 +13%/级'},
+    {k:'cdm',  n:'灵·暴伤', per:26,  d:'灵界暴击伤害 +26%/级'},
+    {k:'pen',  n:'灵·穿透', per:6.6, d:'灵界穿透 +6.6%/级'},
+    {k:'dodge',n:'灵·闪避', per:2.6, d:'灵界闪避 +2.6%/级'}
+  ]
+};
+/* ---------- 大节点：1000 级封顶，凡界版 + 灵界版配对 ----------
+   单界点亮 → 该界对应项加成（小头）；两界配对 → 共鸣（大头，战力 + 掉落）。
+   sf / sl：绑定的凡界 / 灵界小节点 key —— 该侧等级上限 = 绑定小节点等级 ÷ 10。
+   刻意不含「灵天赋抽奖券」节点（用户要求）。 */
+const MAI_BIG = [
+  {k:'atk',   fr:'攻　击',   lmg:'灵界攻击', res:0, sf:'atk',  sl:'atk'},
+  {k:'box',   fr:'凡尘宝箱', lmg:'强化石',   res:1, sf:'hp',   sl:'hp'},
+  {k:'gem',   fr:'宝　石',   lmg:'符　文',   res:1, sf:'crit', sl:'hit'},
+  {k:'neili', fr:'内　力',   lmg:'灵　力',   res:1, sf:'cdm',  sl:'cdm'},
+  {k:'relic', fr:'遗物碎片', lmg:'法　宝',   res:1, sf:'fdm',  sl:'def'},
+  {k:'pill',  fr:'丹　药',   lmg:'灵　魂',   res:1, sf:'psn',  sl:'pen'},
+  {k:'ore',   fr:'矿　石',   lmg:'灵　蕴',   res:1, sf:'ign',  sl:'dodge'}
+];
+const MAI_BIG_MAX  = null;                 /* 1.94：大节点取消等级上限（原 1000，改由成本曲线收敛） */
+const MAI_SMALL_PER_BIG = 10;              /* 小节点每 N 级 → 大节点 1 级 */
+const MAI_BIG_SOLO = 1.4;                 /* 单界每级加成 %（资源类）1.96：0.7 → 1.4（大节点增强） */
+const MAI_BIG_SOLO_ATTR = 2.8;            /* 属性类单界每级 %　1.96：1.4 → 2.8 */
+const MAI_RESO_PER = 0.09;                /* 共鸣每级 → 战力/掉落 +0.09%（1.96：0.07 → 0.09） */
+const MAI_RESO_SPD_SCALE = 0.15;  /* 共鸣对攻速打折（2.03：0.3 → 0.15） */
+
+/* ---------- 矿脉 ---------- */
+const MAI_Q_N   = ['凡','灵','玄','神','仙'];
+const MAI_Q_MUL = [1, 2.4, 6, 15, 42];             /* 产出倍率 1.96：整体削弱约 45%（神 26→15、仙 80→42） */
+const MAI_MINE_N    = 6;                          /* 每界每日矿点数（1.97：12 → 6 —— 保底改为「连续未出才补」后不再需要扩张席位，产出回到 1.96 削弱后的口径） */
+const MAI_MINE_CAP_H= 24;                         /* 产出累积上限（小时） */
+const MAI_OUT_BASE  = {fr: 240, lmg: 144};        /* 每小时产出基数（1.96：400/240 → 240/144，削弱 40%） */
+const MAI_OUT_LV_K  = 0.55;                       /* 等级对产出的加成系数（1.96：0.7 → 0.55） */
+const MAI_Q_W       = [40, 25, 18, 11, 6];        /* 品质出现权重 凡/灵/玄/神/仙（1.93：神 7→11、仙 3→6） */
+const MAI_MINE_HI_MISS = 10;                      /* 1.97：连续 N 次刷新都没出「神品及以上」才补偿 1 处（原 1.96 为「每批保证 10 处」，语义错误已修正） */
+const MAI_MINE_HI_XIAN = 0.25;                    /* 保底补位时直接给仙品的概率（其余给神品） */
+/* 1.93 矿脉加强：产出基数 ×2、等级系数 0.5→0.7、品质倍率高档再拉开（神 14→26、仙 32→80），
+   并给高品质让出更多席位（神 7→11、仙 3→6）+ 每界每日保底 2 处「神品及以上」。
+   综合（同等级口径）：凡品约 ×2.8、玄品约 ×4.2、神品约 ×5.8、仙品约 ×7 —— 高档矿收益显著更高。
+   实测品质分布：凡 23% / 灵 24% / 玄 18% / 神 27% / 仙 8%（仙品靠权重，仍稀有）。 */
+const MAI_REROLL_BASE = {fr: 500, lmg: 300};      /* 刷新品质起始价（宝石/灵石） */
+const MAI_REROLL_GROW = 1.6;                      /* 刷新价格递增（每日重置） */
+/* 占领判定用「等效关卡」而非绝对战力：需求量 = 矿等级 × 10 × 品质系数 */
+const MAI_Q_NEED = [1, 1.5, 2.2, 3.2, 4.5];
+
+/* ---------- 存档 ---------- */
+function maiData(){
+  if(!S.mai) S.mai = {};
+  const m = S.mai;
+  if(!m.small) m.small = {};
+  if(!m.small.fr)  m.small.fr = {};
+  if(!m.small.lmg) m.small.lmg = {};
+  if(!m.big)  m.big = {};
+  if(!m.mine) m.mine = {};
+  if(!m.reroll) m.reroll = {};
+  m.ore = Math.max(0, Math.floor(m.ore || 0));
+  m.ly  = Math.max(0, Math.floor(m.ly  || 0));
+  m.mineTs = m.mineTs || 0;
+  return m;
+}
+function maiResName(realm){ return realm === 'lmg' ? '灵蕴' : '矿石'; }
+
+/* ---------- 小节点 ---------- */
+function maiSmallDef(realm, k){
+  const list = MAI_SMALL[realm] || [];
+  for(let i = 0; i < list.length; i++) if(list[i].k === k) return list[i];
+  return null;
+}
+function maiSmallName(realm, k){ const d = maiSmallDef(realm, k); return d ? d.n : k; }
+/* 1.94：小节点取消等级上限（原 300）。改为「高投入高回报」——每级加成 ×2、成本指数 1.25→1.5、
+   基价 ×1.5，靠成本曲线自然收敛，不再硬性夹断。 */
+const MAI_SMALL_MAX_LV = null;
+function _maiClampS(v){
+  const x = Math.max(0, Math.floor(v || 0));
+  return MAI_SMALL_MAX_LV ? Math.min(MAI_SMALL_MAX_LV, x) : x;
+}
+function maiSmallLv(realm, k){
+  const m = maiData();
+  return _maiClampS((m.small[realm] || {})[k] || 0);
+}
+function maiSmallSet(realm, k, v){ maiData().small[realm][k] = _maiClampS(v); }
+/* 成本：幂函数递增（延续 1.41 的偏好，前高后缓）；1.49 下调（小节点便宜） */
+/* 按「当前等级」算价的纯函数 —— 批量预估需要在不真实扣资源的前提下试算多级，
+   故与 maiSmallCost 拆开：后者读实时等级，前者可传入任意 lv。 */
+function maiSmallCostAt(realm, lv){
+  const base = realm === 'lmg' ? 36 : 108;     /* 1.96：基价 30/90 → 36/108（成本 +20%） */
+  return Math.round(base * Math.pow(lv + 1, 1.43));  /* 1.96：指数 1.4 → 1.43 */
+}
+function maiSmallCost(realm, k){ return maiSmallCostAt(realm, maiSmallLv(realm, k)); }
+function maiSmallSum(realm, k){
+  const d = maiSmallDef(realm, k);
+  return d ? d.per * maiSmallLv(realm, k) : 0;
+}
+
+/* ---------- 大节点 ---------- */
+function maiBigDef(k){ for(let i = 0; i < MAI_BIG.length; i++) if(MAI_BIG[i].k === k) return MAI_BIG[i]; return null; }
+function maiBigLv(k, realm){
+  const m = maiData();
+  const d = m.big[k] || (m.big[k] = {fr:0, lmg:0});
+  const v = Math.max(0, Math.floor(d[realm] || 0));
+  /* 1.94：读回时 clamp 到「绑定小节点 ÷ 10」——旧档曾按固定上限存过值，
+     解除上限后若小节点等级偏低，残留等级会超出绑定上限，需在此收敛。 */
+  if(!maiBigDef(k)) return v;
+  const mx = maiBigMaxLv(k, realm);
+  return mx > 0 ? Math.min(mx, v) : v;
+}
+function maiBigSet(k, realm, v){
+  const m = maiData();
+  if(!m.big[k]) m.big[k] = {fr:0, lmg:0};
+  const x = Math.max(0, Math.floor(v));
+  m.big[k][realm] = MAI_BIG_MAX ? Math.min(MAI_BIG_MAX, x) : x;
+}
+/* 该界该大节点的等级上限 = 绑定小节点等级 ÷ 10 */
+function maiBigMaxLv(k, realm){
+  const d = maiBigDef(k); if(!d) return 0;
+  const sk = realm === 'lmg' ? d.sl : d.sf;
+  const n = Math.floor(maiSmallLv(realm, sk) / MAI_SMALL_PER_BIG);
+  return MAI_BIG_MAX ? Math.min(MAI_BIG_MAX, n) : n;
+}
+function maiBigCostAt(realm, lv){
+  const base = realm === 'lmg' ? 276 : 840;      /* 1.96：基价 230/700 → 276/840（成本 +20%） */
+  return Math.round(base * Math.pow(lv + 1, 1.88));   /* 1.96：指数 1.85 → 1.88 */
+}
+function maiBigCost(k, realm){ return maiBigCostAt(realm, maiBigLv(k, realm)); }
+/* 单界加成 %：属性类 ×MAI_BIG_SOLO_ATTR，资源类 ×MAI_BIG_SOLO */
+function maiBigSolo(k, realm){
+  const d = maiBigDef(k); if(!d) return 0;
+  const per = d.res ? MAI_BIG_SOLO : MAI_BIG_SOLO_ATTR;
+  return per * maiBigLv(k, realm);
+}
+/* 共鸣：取两界较小值（必须两界都投入才涨） */
+function maiBigReso(k){ return Math.min(maiBigLv(k, 'fr'), maiBigLv(k, 'lmg')); }
+/* 共鸣等级 = 所有大节点（有上限者）的共鸣总和，0 ~ 8×1000 = 8000 */
+function maiReso(){
+  let s = 0;
+  for(let i = 0; i < MAI_BIG.length; i++) s += maiBigReso(MAI_BIG[i].k);
+  return s;
+}
+function maiResoMax(){ return MAI_BIG_MAX ? MAI_BIG.length * MAI_BIG_MAX : null; }
+function maiResoPct(){ return maiReso() * MAI_RESO_PER; }
+/* 1.75：共鸣对「灵界属性」改为独立乘区（不再进加法池被稀释）。
+   仅作用于 lin / exp / fix 类战斗属性，pct 类（暴击/暴伤/连击/资源）不享受，
+   与改之前的作用范围保持一致。 */
+function maiResoMul(){ return 1 + maiResoPct() / 100; }
+
+/* ---------- 加成出口（供其它系统调用） ---------- */
+function maiFrDropPct(k){ return maiBigSolo(k, 'fr') + maiResoPct(); }
+function maiLmgDropPct(k){ return maiBigSolo(k, 'lmg') + maiResoPct(); }
+/* 灵界属性 %：小节点 + 大节点灵界侧单界加成（1.75：共鸣已移出，改走独立乘区 maiResoMul） */
+function maiLmgPct(k){ return maiSmallSum('lmg', k) + maiBigSolo(k, 'lmg'); }
+
+/* ---------- 矿脉：每日刷新 ---------- */
+function maiMaxMineLv(realm){
+  const lv = realm === 'lmg' ? (S.lmgMaxLv || 1) : (S.stLv || 1);
+  return Math.max(1, Math.floor(lv / 10));
+}
+function maiRollQ(){
+  const w = MAI_Q_W;
+  let r = Math.random() * 100, acc = 0, q = 0;
+  for(let i = 0; i < w.length; i++){ acc += w[i]; if(r < acc){ q = i; break; } q = i; }
+  return q;
+}
+function maiRollLv(maxLv){
+  if(maxLv <= 1) return 1;
+  return Math.max(1, Math.min(maxLv, Math.ceil(Math.pow(Math.random(), 2.2) * maxLv)));
+}
+function maiMineList(realm){
+  const m = maiData();
+  if(!m.mine[realm] || !Array.isArray(m.mine[realm])) m.mine[realm] = [];
+  return m.mine[realm];
+}
+function maiMineRoll(realm){
+  const m = maiData();
+  const maxLv = maiMaxMineLv(realm);
+  const arr = [];
+  for(let i = 0; i < MAI_MINE_N; i++){
+    arr.push({q: maiRollQ(), lv: maiRollLv(maxLv), occ: false, st: 0, acc: 0});
+  }
+  /* 1.97 高品质保底（语义修正）：不再是「每批保证 N 处」，而是「连续 N 次刷新都没出高品质
+     才补偿 1 处」—— 中途只要出了任意一处即重新计数，故高品质仍以权重为主、稀有度得以保留。
+     补位只升 1 处且取品质最低者，默认给神品，仅 MAI_MINE_HI_XIAN 概率直接给仙品。 */
+  let hi = 0;
+  for(let i = 0; i < arr.length; i++) if(arr[i].q >= 3) hi++;
+  if(!m.hiMiss) m.hiMiss = {};
+  if(hi > 0){
+    m.hiMiss[realm] = 0;                        /* 本批出了 → 连续未出计数归零 */
+  } else {
+    m.hiMiss[realm] = (m.hiMiss[realm] || 0) + 1;
+    if(m.hiMiss[realm] >= MAI_MINE_HI_MISS){
+      m.hiMiss[realm] = 0;
+      let low = 0;
+      for(let i = 1; i < arr.length; i++) if(arr[i].q < arr[low].q) low = i;
+      arr[low].q = (Math.random() < MAI_MINE_HI_XIAN) ? 4 : 3;
+    }
+  }
+  m.mine[realm] = arr;
+}
+/* 每满 24 小时重新随机全部矿点，并清除占领（需重新打） */
+const MAI_REFRESH_MS = 24 * 3600 * 1000;
+function maiDailyRoll(){
+  const m = maiData();
+  const now = Date.now();
+  if(m.mineTs && (now - m.mineTs) < MAI_REFRESH_MS) return false;
+  m.mineTs = now;
+  maiMineRoll('fr'); maiMineRoll('lmg');
+  m.reroll.fr = 0; m.reroll.lmg = 0;
+  return true;
+}
+/* 占领该矿所需的最高关卡 */
+function maiGuard(realm, q, lv){
+  return Math.max(1, Math.ceil(lv * 10 * (MAI_Q_NEED[q] || 1)));
+}
+function maiCurLv(realm){ return Math.max(1, realm === 'lmg' ? (S.lmgMaxLv || 1) : (S.stLv || 1)); }
+/* ---------- 矿脉守卫战：占领必须击败守卫 ----------
+   凡矿 → 凡人界战斗数值；灵矿 → 灵界战斗数值（与用户要求一致）。
+   守卫血量 = 该界第（矿等级 × 10）关怪物血量 × 品质倍率 —— 随玩家进度自动缩放，
+   且「等级越高、品质越高」都让血量成倍上升，二者叠加即为「超级厉害」。
+   守卫攻击 = 玩家该界最大血量的百分比 × (1 + 等级×5%) —— 同样随品质与等级上升，
+   且因按玩家血量取比例，任何阶段都不会出现「一击秒杀」或「刮痧打不动」。 */
+const MAI_GUARD_HP_MUL = [1, 2, 4, 8, 16];
+const MAI_GUARD_ATK_Q  = 0.02;      /* 基础：玩家最大血 2%，每档品质 +1% */
+const MAI_GUARD_ATK_LV = 0.05;      /* 每级 +5% */
+const MAI_GUARD_ATK_MS = 2000;      /* 守卫每 2 秒反击一次 */
+
+function maiGuardMaxHp(realm, q, lv){
+  const L = Math.max(1, lv * 10);
+  let base;
+  if(realm === 'lmg'){
+    base = dNum(lmgMonHpFor(L));
+  } else {
+    base = Number(dNum(dmul(BASE_HP, dpow(BASE_GROW, L - 1))));   /* BASE_HP / BASE_GROW 本身即大数对象 */
+  }
+  if(!isFinite(base) || base <= 0) base = 1e4;
+  return base * MAI_GUARD_HP_MUL[q];
+}
+function maiGuardAtk(realm, q, lv){
+  let mx;
+  if(realm === 'lmg') mx = dNum(lmgAttrD('hp'));
+  else mx = dNum(_toD(S.maxHp || D(1)));
+  if(!isFinite(mx) || mx <= 0) mx = 1e3;
+  return Math.max(1, mx * (MAI_GUARD_ATK_Q + 0.01 * q) * (1 + lv * MAI_GUARD_ATK_LV));
+}
+/* 放弃该界占领（可选：先结算已累积产出，不让玩家白等） */
+function maiAbandon(realm, keepAcc){
+  const list = maiMineList(realm);
+  let n = 0;
+  for(let i = 0; i < list.length; i++){
+    const mn = list[i]; if(!mn || !mn.occ) continue;
+    if(!keepAcc){
+      const got = Math.floor(maiAcc(realm, mn));
+      if(got > 0){
+        const m = maiData();
+        if(realm === 'lmg') m.ly  = Math.min(SAFE_INT, m.ly  + got);
+        else                m.ore = Math.min(SAFE_INT, m.ore + got);
+      }
+    }
+    mn.occ = false; mn.acc = 0; mn.st = 0; n++;
+  }
+  if(S.inMine && S.inMine.realm === realm) S.inMine = null;
+  return n;
+}
+/* 挑战：进入守卫战 */
+function maiMineOccupy(realm, i){
+  const list = maiMineList(realm);
+  const mn = list[i]; if(!mn || mn.occ) return;
+  if(S.realm !== realm){
+    toast('需先' + (realm === 'lmg' ? '飞升进入灵界' : '返回凡人界') + '方可挑战');
+    return;
+  }
+  if(S.inTower || S.inBoss || S.inSecret){ toast('请先退出当前挑战'); return; }
+  /* 每界同时只能占领 1 处：进入战斗前先放弃已占领的（产出先结算，不白等） */
+  const ab = maiAbandon(realm, false);
+  if(ab) toast('已放弃原有矿脉，产出已结算');
+  const hp = maiGuardMaxHp(realm, mn.q, mn.lv);
+  S.inMine = {realm: realm, i: i, hp: hp, maxHp: hp, last: Date.now()};
+  applyMineUI(); renderMai();
+  logMsg('灵脉·挑战' + (realm === 'lmg' ? '灵矿' : '凡矿') + '守卫（' + MAI_Q_N[mn.q] + '品 Lv.' + mn.lv + '）');
+  toast('击败守卫即可占领！');
+  save();
+}
+/* 单次伤害：凡人界（与 doHit 同口径） */
+function mineFrDmg(){
+  const _atk = calcAtk();
+  let sum = dmul(_atk, D(0.92 + Math.random() * 0.16));
+  if(Math.random() * 100 < calcCrit()) sum = dmul(sum, D(critMult()));
+  sum = dadd(sum, dmul(_atk, D(calcIgn() / 100)));
+  { const _cs = {n:0, hit:false}; sum = comboAdd(sum, _atk, 0.15, 0.92, 0.16, _cs); }
+  sum = dmul(sum, D(1 + tSum('nmult') / 100));
+  sum = dmul(sum, D(1 + calcFdm() / 100));
+  return sum;
+}
+/* 单次伤害：灵界（期望单次 = DPS ÷ 攻速） */
+function mineLmgDmg(){
+  const aps = Math.max(0.2, Math.min(LMG_APS_CAP, lmgAttrVal('spd')));
+  return dNum(lmgDps()) / aps;
+}
+function doMineHit(manual){
+  const f = S.inMine; if(!f) return null;
+  if(manual && typeof manualClickOk === 'function' && !manualClickOk()) return null;
+  hitInc();
+  const list = maiMineList(f.realm), mn = list[f.i];
+  if(!mn){ S.inMine = null; applyMineUI(); return null; }
+  const dmg = (f.realm === 'lmg') ? mineLmgDmg() : dNum(mineFrDmg());
+  f.hp = Math.max(0, f.hp - (isFinite(dmg) ? dmg : 0));
+  /* 守卫反击 */
+  const now = Date.now();
+  if(now - (f.last || 0) >= MAI_GUARD_ATK_MS){
+    f.last = now;
+    const atk = maiGuardAtk(f.realm, mn.q, mn.lv);
+    if(f.realm === 'lmg'){
+      const h = dsub(_toD(S.lmgHp || D(0)), D(atk));
+      S.lmgHp = dcmp(h, D(0)) < 0 ? D(0) : h;
+    } else {
+      const h = dsub(_toD(S.hp || D(0)), D(atk));
+      S.hp = dcmp(h, D(0)) < 0 ? D(0) : h;
+    }
+  }
+  /* 败：血量归零 */
+  const dead = (f.realm === 'lmg') ? dcmp(_toD(S.lmgHp || D(0)), D(1)) < 0
+                                   : dcmp(_toD(S.hp || D(0)), D(1)) < 0;
+  if(dead){
+    logMsg('灵脉·不敌守卫，撤退疗伤');
+    toast('不敌守卫，已撤退');
+    if(f.realm === 'lmg') S.lmgHp = lmgAttrD('hp'); else { S.maxHp = frMaxHpSuppressed(dmul(BASE_HP, dpow(BASE_GROW, S.level - 1))); S.hp = S.maxHp; }
+    S.inMine = null; applyMineUI(); renderMai(); render(); save();
+    return null;
+  }
+  /* 胜：占领 */
+  if(f.hp <= 0){
+    mn.occ = true; mn.st = Date.now(); mn.acc = 0;
+    S.inMine = null;
+    logMsg('灵脉·占领' + (f.realm === 'lmg' ? '灵矿' : '凡矿') + '（' + MAI_Q_N[mn.q] + '品 Lv.' + mn.lv + '）');
+    toast('占领成功！' + MAI_Q_N[mn.q] + '品 Lv.' + mn.lv);
+    applyMineUI(); renderMai(); render(); save();
+    return null;
+  }
+  renderMineBar();
+  return dmg;
+}
+function applyMineUI(){
+  const bar = $('mineModeBar'); if(bar) bar.style.display = S.inMine ? '' : 'none';
+  renderMineBar();
+}
+function renderMineBar(){
+  if(!S.inMine) return;
+  const f = S.inMine, list = maiMineList(f.realm), mn = list[f.i];
+  if(!mn) return;
+  const nm = $('mmName'), fl = $('mmFill'), tx = $('mmTxt');
+  if(nm) nm.textContent = (f.realm === 'lmg' ? '灵矿 ' : '凡矿 ') + MAI_Q_N[mn.q] + '品 Lv.' + mn.lv;
+  const pct = f.maxHp > 0 ? Math.max(0, Math.min(100, f.hp / f.maxHp * 100)) : 0;
+  if(fl) fl.style.width = pct + '%';
+  if(tx) tx.textContent = nStr(Math.floor(f.hp)) + ' / ' + nStr(Math.floor(f.maxHp));
+}
+function maiFightExit(){
+  if(!S.inMine) return;
+  const f = S.inMine;
+  S.inMine = null; applyMineUI(); renderMai(); render();
+  logMsg('灵脉·撤离矿脉战场');
+  toast('已撤离'); save();
+}
+/* 产出速率（每小时） */
+function maiOutPH(realm, mn){
+  const pct = realm === 'lmg' ? maiLmgDropPct('ore') : maiFrDropPct('ore');
+  return MAI_OUT_BASE[realm] * MAI_Q_MUL[mn.q] * (1 + mn.lv * MAI_OUT_LV_K) * (1 + pct / 100);
+}
+function maiAcc(realm, mn){
+  if(!mn.occ) return mn.acc || 0;
+  const hours = Math.min(MAI_MINE_CAP_H, (Date.now() - (mn.st || Date.now())) / 3600000);
+  return Math.min(maiOutPH(realm, mn) * MAI_MINE_CAP_H, (mn.acc || 0) + maiOutPH(realm, mn) * hours);
+}
+function maiClaim(realm, i){
+  const m = maiData(), list = maiMineList(realm), mn = list[i];
+  if(!mn || !mn.occ) return;
+  const got = Math.floor(maiAcc(realm, mn));
+  if(got <= 0){ toast('暂无可领取'); return; }
+  if(realm === 'lmg') m.ly  = Math.min(SAFE_INT, m.ly  + got);
+  else                m.ore = Math.min(SAFE_INT, m.ore + got);
+  mn.acc = 0; mn.st = Date.now();
+  toast(maiResName(realm) + ' +' + nStr(got));
+  logMsg('灵脉·领取' + maiResName(realm) + ' +' + nStr(got));
+  renderMai(); save();
+}
+function maiClaimAll(realm){
+  const m = maiData(), list = maiMineList(realm);
+  let tot = 0;
+  for(let i = 0; i < list.length; i++){
+    const mn = list[i];
+    if(!mn || !mn.occ) continue;
+    const got = Math.floor(maiAcc(realm, mn));
+    if(got <= 0) continue;
+    tot += got; mn.acc = 0; mn.st = Date.now();
+  }
+  if(tot <= 0){ toast('无可领取产出'); return; }
+  if(realm === 'lmg') m.ly  = Math.min(SAFE_INT, m.ly  + tot);
+  else                m.ore = Math.min(SAFE_INT, m.ore + tot);
+  toast(maiResName(realm) + ' +' + nStr(tot));
+  logMsg('灵脉·一键领取' + maiResName(realm) + ' +' + nStr(tot));
+  renderMai(); save();
+}
+function maiRerollCost(realm){
+  const n = Math.max(0, Math.floor((maiData().reroll[realm] || 0)));
+  return Math.round(MAI_REROLL_BASE[realm] * Math.pow(MAI_REROLL_GROW, n));
+}
+function maiMineReroll(realm){
+  const m = maiData();
+  const c = maiRerollCost(realm);
+  if(realm === 'lmg'){
+    if((S.lmgStone || 0) < c){ toast('灵石不足（需 ' + nStr(c) + '）'); return; }
+    S.lmgStone -= c;
+  } else {
+    if(!resHas('gem', c)){ toast('宝石不足（需 ' + nStr(c) + '）'); return; }
+    resPay('gem', c);
+  }
+  m.reroll[realm] = (m.reroll[realm] || 0) + 1;
+  /* 手动刷新 = 放弃当前占领（产出先结算，不让玩家白等） */
+  const _ab = maiAbandon(realm, false);
+  if(_ab) toast('已放弃原矿脉，产出已结算');
+  maiMineRoll(realm);
+  toast('已刷新矿脉（' + (realm === 'lmg' ? '灵石' : '宝石') + ' -' + nStr(c) + '）');
+  logMsg('灵脉·刷新矿脉，消耗 ' + (realm === 'lmg' ? '灵石' : '宝石') + ' ' + nStr(c));
+  renderMai(); save();
+}
+
+/* ---------- 节点升级 ----------
+   1.96：新增批量档位（+1 / +10 / +100 / MAX）。选好档位后点一次按钮即连升多级，
+   避免后期几十级靠连点到手酸。MAX 档受 MAI_BATCH_MAX 约束，不会卡死主线程。 */
+const MAI_BATCH_MAX = 2000;            /* 单次批量升级的级数上限（与 UI_BATCH_MAX 同值；
+   注：此处在通用档位条组件之前执行，不可直接引用 UI_BATCH_MAX —— const 存在暂时性死区，
+   顶层提前引用会抛 ReferenceError。两者数值保持一致即可。） */
+/* 1.99：灵脉档位条改用通用组件 stepBar，与其它面板完全同一套样式 / 行为 */
+function maiStepSet(v){ stepSet('mai', v); renderMai(); }
+function maiStepN(){ return stepN('mai'); }
+function maiStepLabel(){ return stepTxt('mai'); }
+/* 试算：在「不真实扣资源」的前提下算出本档位实际能升几级、共花多少 */
+function maiPlan(costAt, realm, curLv, want, capLv){
+  const m = maiData();
+  const rk = realm === 'lmg' ? 'ly' : 'ore';
+  let avail = m[rk], sum = 0, n = 0, lv = curLv;
+  while(n < want){
+    if(capLv !== null && lv >= capLv) break;
+    const c = costAt(realm, lv);
+    if(sum + c > avail) break;
+    sum += c; lv++; n++;
+  }
+  return {n: n, cost: sum};
+}
+function maiUpSmall(realm, k){
+  const m = maiData();
+  const d = maiSmallDef(realm, k); if(!d) return;
+  const rk = realm === 'lmg' ? 'ly' : 'ore';
+  const pl = maiPlan(maiSmallCostAt, realm, maiSmallLv(realm, k), maiStepN(), null);
+  if(pl.n === 0){ toast(maiResName(realm) + '不足（需 ' + nStr(maiSmallCost(realm, k)) + '）'); return; }
+  m[rk] -= pl.cost;
+  maiSmallSet(realm, k, maiSmallLv(realm, k) + pl.n);
+  toast(d.n + ' +' + pl.n + ' 级　-' + nStr(pl.cost) + ' ' + maiResName(realm));
+  renderMai(); save();
+}
+function maiUpBig(k, realm){
+  const m = maiData();
+  const mx = maiBigMaxLv(k, realm);
+  if(maiBigLv(k, realm) >= mx){
+    const d = maiBigDef(k);
+    const sk = realm === 'lmg' ? d.sl : d.sf;
+    const need = (maiBigLv(k, realm) + 1) * MAI_SMALL_PER_BIG;
+    toast('需先将「' + maiSmallName(realm, sk) + '」升至 ' + need + ' 级（当前 ' + maiSmallLv(realm, sk) + '）');
+    return;
+  }
+  const rk = realm === 'lmg' ? 'ly' : 'ore';
+  const pl = maiPlan(maiBigCostAt, realm, maiBigLv(k, realm), maiStepN(), mx);
+  if(pl.n === 0){ toast(maiResName(realm) + '不足（需 ' + nStr(maiBigCost(k, realm)) + '）'); return; }
+  m[rk] -= pl.cost;
+  maiBigSet(k, realm, maiBigLv(k, realm) + pl.n);
+  toast((realm === 'lmg' ? maiBigDef(k).lmg : maiBigDef(k).fr) + ' +' + pl.n + ' 级　-' + nStr(pl.cost) + ' ' + maiResName(realm));
+  renderMai(); save();
+}
+
+/* ---------- UI：界页签 × 分区页签（分区显示，避免超出屏幕） ---------- */
+let _maiTab = 'fr';        /* fr = 凡脉 / lmg = 灵脉 */
+let _maiPage = 'mine';     /* mine = 矿脉 / small = 小节点 / big = 大节点 */
+function openMai(){
+  maiDailyRoll();
+  renderMai();
+  const o = $('maiOverlay'); if(o) o.classList.add('show');
+}
+function closeMai(){ const o = $('maiOverlay'); if(o) o.classList.remove('show'); }
+function maiTab(k){ _maiTab = k; renderMai(); }
+function maiPage(k){ _maiPage = k; renderMai(); }
+
+/* 批量升级档位条：+1 / +10 / +100 / MAX */
+function maiStepBar(){ return stepBar('mai', renderMai, '点一次按此档位连升'); }
+
+/* ══════ 通用「批量档位条」组件（1.99）═════
+   把原先塞在每张卡片底部的 ×10 / MAX / 一键升满 等按钮，统一挪到面板顶部选择：
+     · 每个面板独立记忆档位（资源量级差异大，互不影响）
+     · 点一次升级按钮即按当前档位连升，省掉每条卡片 2~4 个小按钮的竖向空间
+   用法：stepBar(面板key, 重绘函数) 生成 HTML；stepN(面板key) 取本次应升级的级数。 */
+const UI_STEPS = [1, 10, 100, 'max'];
+const UI_BATCH_MAX = 2000;      /* MAX 档单次试算上限（纯性能保护，非设计上限，可连点继续升） */
+const _uiStep = {};             /* 面板key → 当前档位 */
+const _uiStepRender = {};       /* 面板key → 重绘函数（切换档位后刷新高亮 / 成本） */
+function stepGet(k){ const v = _uiStep[k]; return (v === undefined) ? 1 : v; }
+function stepIsMax(k){ return stepGet(k) === 'max'; }
+function stepSet(k, v){
+  _uiStep[k] = v;
+  const f = _uiStepRender[k];
+  if(typeof f === 'function'){ try{ f(); }catch(e){} }
+}
+function stepN(k){ const v = stepGet(k); return (v === 'max') ? UI_BATCH_MAX : v; }
+function stepTxt(k){ const v = stepGet(k); return (v === 'max') ? 'MAX' : ('×' + v); }
+function stepBar(k, renderFn, hint){
+  if(typeof renderFn === 'function') _uiStepRender[k] = renderFn;
+  let h = '<div class="ui-steps">';
+  UI_STEPS.forEach(function(v){
+    const on = (stepGet(k) === v);
+    h += '<div class="ui-step' + (on ? ' on' : '') + '" onclick="stepSet(\'' + k + '\',' +
+         (v === 'max' ? "'max'" : v) + ')">' + (v === 'max' ? 'MAX' : ('×' + v)) + '</div>';
+  });
+  h += '<span class="ui-step-hint">' + (hint || '点一次按此档位连升') + '</span></div>';
+  return h;
+}
+/* —— 各面板的「按档位批量升级」实现（1.99）：档位 > 1 时连升，MAX 档在各自上限内尽量升满 —— */
+/* 2.00：批量升级试算（只算不扣，供按钮显示「本次能升几级 · 总价多少」） */
+function farmUpPlan(want){
+  const cap = farmLvCap();
+  let lv = S.farmLv || 0, gem = resD('gem'), cnt = 0, cost = D(0);
+  const w = Math.max(1, Math.floor(want) || 1);
+  while(lv < cap && cnt < w){
+    const c = Math.min(SAFE_INT, Math.round(25 * Math.pow(1.12, Math.max(0, lv - 1)) * Math.pow(1.5, S.farmStage || 0)));
+    if(dcmp(gem, D(c)) < 0) break;
+    gem = dsub(gem, D(c)); cost = dadd(cost, D(c)); lv++; cnt++;
+  }
+  return {cnt:cnt, cost:cost, lv:lv};
+}
+function farmUpgradeN(n){
+  farmInit();
+  if((S.farmLv || 0) >= farmLvCap()){ toast('已达当前阶上限 Lv.' + farmLvCap() + '，需先进阶'); return; }
+  const want = (n === 0 || n === 'max') ? UI_BATCH_MAX : Math.max(1, Math.floor(n) || 1);
+  let cnt = 0, lastCost = 0;
+  while((S.farmLv || 0) < farmLvCap() && cnt < want){
+    const c = farmUpCost();
+    if(!resHas('gem', c)){ lastCost = c; break; }
+    resPay('gem', c); S.farmLv++; cnt++;
+  }
+  if(cnt === 0){
+    const short = dsub(D(lastCost || 0), resD('gem'));
+    toast(dcmp(short, D(0)) > 0 ? ('宝石不足（还需 ' + dStr(short) + '）') : '当前无法继续升级');
+    return;
+  }
+  toast('荒田 +' + cnt + ' 级 → Lv.' + S.farmLv + '（产量 +' + Math.round((farmGemMul() - 1) * 100) + '%）');
+  logMsg('药园升级：荒田 +' + cnt + ' 级 → Lv.' + S.farmLv);
+  renderFarm(); render(); save();
+}
+function caveUpN(k, n){
+  const d = caveData();
+  const want = (n === 0 || n === 'max') ? UI_BATCH_MAX : Math.max(1, Math.floor(n) || 1);
+  let cnt = 0;
+  while(cnt < want){
+    const c = caveUpCost(k);
+    if((d.jade || 0) < c) break;
+    d.jade -= c; d.lv[k] = caveLv(k) + 1; cnt++;
+  }
+  if(cnt === 0){ toast('洞府灵玉不足（需 ' + nStr(caveUpCost(k)) + '）'); return; }
+  toast((caveLineDef(k) || {}).n + '产线 +' + cnt + ' 级 → Lv.' + d.lv[k]);
+  logMsg('洞府升级：【' + (caveLineDef(k) || {}).n + '】产线 Lv.' + d.lv[k] + '（+' + cnt + ' 级）');
+  renderCave(); save();
+}
+function relicLevelUpN(k, n){
+  if(n === 0 || n === 'max'){ relicLevelUpMax(k); return; }
+  if(!n || n <= 1){ relicLevelUp(k); return; }
+  if(!S.relics || !S.relics[k]){ toast('尚未拥有此遗物'); return; }
+  const lv0 = relicLv(k), ad = relicAd(k);
+  if(lv0 >= RELIC_LV_MAX){ toast('已升满 ' + RELIC_LV_MAX + ' 级，请点击「突破」'); return; }
+  let acc = D(0), target = lv0;
+  for(let i = 0; i < n && target < RELIC_LV_MAX; i++){
+    const need = relicFgNeed(target + 1, ad, k);
+    const nx = dadd(acc, need);
+    if(dcmp(nx, resD('relicFrag')) > 0) break;
+    acc = nx; target++;
+  }
+  if(target === lv0){ relicLevelUp(k); return; }
+  payCost('relicFrag', acc);
+  S.relicLv = S.relicLv || {}; S.relicLv[k] = target;
+  const r = RELICS.find(function(x){ return x.k === k; });
+  toast('【' + r.n + '】+' + (target - lv0) + ' 级 → ' + target + ' / ' + RELIC_LV_MAX + ' 级');
+  logMsg('【' + r.n + '】升级 ' + lv0 + ' → ' + target + ' 级，效果 ' + relicVal(k));
+  renderRelic(); render(); save();
+}
+/* 符文档位语义是「喂几枚碎片」，MAX = 把手里碎片全喂进去 */
+function runeDoFeedStep(id){
+  runeFeedShard(id, stepIsMax('rune') ? runeShard() : stepN('rune'));
+  const s = runeSlotOf(id); if(s >= 0) runeSlotSheet(s); else closeItemSheet();
+}
+function clsSkDoUpN(i, cid){
+  const want = stepIsMax('cls') ? CLS_SK_MAX : stepN('cls');
+  let cnt = 0;
+  while(cnt < want && clsSpFree() > 0 && clsSkLv(i) < CLS_SK_MAX){ clsSkillUp(i); cnt++; }
+  clsSkInfo(cid, i);
+}
+/* 凡人界属性面板档位条（独立容器，切换档位后顺带刷新成本行与按钮可用性） */
+function renderAttrStepBar(){
+  const sb = $('attrStepBar');
+  if(sb) sb.innerHTML = stepBar('attr', renderAttrStepBar, '点一次按此档位购买');
+  if(typeof render === 'function'){ try{ render(); }catch(e){} }
+}
+function renderMai(){
+  const o = $('maiOverlay'); if(!o) return;
+  const m = maiData();
+  const realm = _maiTab;
+  const resN = maiResName(realm);
+
+  /* 顶部：资源 + 共鸣 */
+  const head = $('maiHead');
+  if(head){
+    head.innerHTML =
+      '<div class="mai-hd">' +
+      '<div class="mai-res"><span>矿石</span><b>' + nStr(m.ore) + '</b></div>' +
+      '<div class="mai-res"><span>灵蕴</span><b>' + nStr(m.ly) + '</b></div>' +
+      '<div class="mai-res hi"><span>共鸣等级</span><b>' + nStr(maiReso()) +
+        (maiResoMax() === null ? '（无上限）' : ' / ' + nStr(maiResoMax())) + '</b></div>' +
+      '<div class="mai-res hi"><span>共鸣加成</span><b>战力 +' + maiResoPct().toFixed(1) + '% · 掉落 +' + maiResoPct().toFixed(1) + '%</b></div>' +
+      '</div>';
+  }
+  /* 界页签 */
+  const tb = $('maiTabs');
+  if(tb){
+    tb.innerHTML = ['fr','lmg'].map(function(r){
+      return '<div class="mai-tab' + (r === realm ? ' on' : '') + '" onclick="maiTab(\'' + r + '\')">' +
+             (r === 'fr' ? '凡　脉' : '灵　脉') + '</div>';
+    }).join('');
+  }
+  /* 分区页签 */
+  const pt = $('maiPageTabs');
+  if(pt){
+    const pages = [['mine','矿　脉'], ['small','小节点'], ['big','大节点']];
+    pt.innerHTML = pages.map(function(p){
+      return '<div class="mai-tab' + (p[0] === _maiPage ? ' on' : '') + '" onclick="maiPage(\'' + p[0] + '\')">' + p[1] + '</div>';
+    }).join('');
+  }
+
+  const body = $('maiBody'); if(!body) return;
+  let h = '';
+
+  /* ---- 矿脉区 ---- */
+  if(_maiPage === 'mine'){
+    const list = maiMineList(realm);
+    const maxLv = maiMaxMineLv(realm);
+    h += '<div class="mai-sec"><div class="mai-sec-h">' + (realm === 'lmg' ? '灵　矿' : '凡　矿') +
+         '<span class="mai-hint">每日随机 · 最高关越高等级越高</span></div>';
+    h += '<div class="mai-mines">';
+    for(let i = 0; i < list.length; i++){
+      const mn = list[i]; if(!mn) continue;
+      const need = maiGuard(realm, mn.q, mn.lv);
+      const cur = maiCurLv(realm);
+      const can = cur >= need;
+      const acc = Math.floor(maiAcc(realm, mn));
+      const cap = Math.floor(maiOutPH(realm, mn) * MAI_MINE_CAP_H);
+      h += '<div class="mai-mine q-' + mn.q + (mn.occ ? ' occ' : '') + '">' +
+           '<div class="mai-mq">' + MAI_Q_N[mn.q] + '品 Lv.' + mn.lv + '</div>' +
+           '<div class="mai-mo">' + nStr(maiOutPH(realm, mn)) + ' ' + resN + '/时</div>' +
+           '<div class="mai-mg">需最高关 ' + nStr(need) + '</div>' +
+           (mn.occ
+             ? '<div class="mai-macc">' + nStr(acc) + ' / ' + nStr(cap) + '</div>' +
+               '<div class="mai-mb ok" onclick="maiClaim(\'' + realm + '\',' + i + ')">领 取</div>'
+             : '<div class="mai-mb' + (S.realm === realm ? '' : ' off') + '" onclick="maiMineOccupy(\'' + realm + '\',' + i + ')">' +
+               (S.realm === realm ? '挑 战' : (realm === 'lmg' ? '需入灵界' : '需回凡界')) + '</div>') +
+           '</div>';
+    }
+    h += '</div>';
+    h += '<div class="mai-ops">' +
+         '<div class="mai-op" onclick="maiClaimAll(\'' + realm + '\')">一键领取</div>' +
+         '<div class="mai-op" onclick="maiMineReroll(\'' + realm + '\')">刷新矿脉（' +
+         (realm === 'lmg' ? '灵石 ' : '宝石 ') + nStr(maiRerollCost(realm)) + '）</div>' +
+         '</div>';
+    h += '<div class="mai-tip">产出累积 ' + MAI_MINE_CAP_H + ' 小时；每日重置</div>';
+    h += '</div>';
+  }
+
+  /* ---- 小节点 ---- */
+  if(_maiPage === 'small'){
+    h += '<div class="mai-sec"><div class="mai-sec-h">小节点<span class="mai-hint">每 10 级解锁对应大节点 1 级</span></div>';
+    h += maiStepBar();
+    h += '<div class="mai-nodes">';
+    const sm = MAI_SMALL[realm] || [];
+    for(let i = 0; i < sm.length; i++){
+      const s = sm[i], lv = maiSmallLv(realm, s.k), c = maiSmallCost(realm, s.k);
+      const pl = maiPlan(maiSmallCostAt, realm, lv, maiStepN(), null);
+      const afford = pl.n > 0;
+      /* 该小节点绑定的大节点 */
+      let bindName = '';
+      for(let j = 0; j < MAI_BIG.length; j++){
+        const b = MAI_BIG[j];
+        if((realm === 'lmg' ? b.sl : b.sf) === s.k){ bindName = '　→　' + (realm === 'lmg' ? b.lmg : b.fr); break; }
+      }
+      h += '<div class="mai-node">' +
+           '<div class="mai-nn">' + s.n + '<span class="mai-nb2">' + bindName + '</span></div>' +
+           '<div class="mai-nl">Lv.' + lv + '　+' + (Math.round(s.per * lv * 10) / 10) + '%</div>' +
+           '<div class="mai-nd">' + s.d + '</div>' +
+           '<div class="mai-nb' + (afford ? '' : ' off') + '" onclick="maiUpSmall(\'' + realm + '\',\'' + s.k + '\')">' +
+           (pl.n > 1 ? ('升 ' + pl.n + ' 级 · ' + nStr(pl.cost)) : (nStr(c))) + ' ' + resN + '</div>' +
+           '</div>';
+    }
+    h += '</div></div>';
+  }
+
+  /* ---- 大节点：凡脉 / 灵脉 分开两栏显示 ---- */
+  if(_maiPage === 'big'){
+    h += '<div class="mai-sec"><div class="mai-sec-h">大节点<span class="mai-hint">' +
+         (MAI_BIG_MAX ? MAI_BIG_MAX + ' 级' : '无上限') +
+         ' · 等级 = 本界绑定小节点 ÷ 10</span></div>';
+    h += maiStepBar();
+    /* 只渲染当前界（跟随顶部「凡脉 / 灵脉」页签），两界不再同屏并列 ——
+       同屏会让玩家误以为两栏要同时投入，且手机上左右分栏后每栏极窄、文案全被压断。 */
+    [realm].forEach(function(rl){
+      const isL = (rl === 'lmg');
+      const resKey = isL ? 'ly' : 'ore';
+      const resN2  = isL ? '灵蕴' : '矿石';
+      const resNow = isL ? m.ly : m.ore;
+      h += '<div class="mai-bigcol' + (isL ? ' col-lmg' : ' col-fr') + '">';
+      h += '<div class="mai-colhd">' + (isL ? '灵　脉' : '凡　脉') +
+           '<span class="mai-colres">' + resN2 + ' ' + nStr(resNow) + '</span></div>';
+      for(let i = 0; i < MAI_BIG.length; i++){
+        const b = MAI_BIG[i];
+        const lv = maiBigLv(b.k, rl), mx = maiBigMaxLv(b.k, rl);
+        const c  = maiBigCost(b.k, rl);
+        const sk = isL ? b.sl : b.sf;
+        const solo = maiBigSolo(b.k, rl), reso = maiBigReso(b.k);
+        const pl = maiPlan(maiBigCostAt, rl, lv, maiStepN(), mx);
+        /* 加成文案：写清「加什么」 */
+        let eff;
+        if(b.res){
+          eff = (isL ? b.lmg : b.fr) + '掉落 +' + solo.toFixed(1) + '%';
+        } else {
+          eff = (isL ? b.lmg : b.fr) + ' +' + solo.toFixed(1) + '%';
+        }
+        const effReso = b.res ? ('掉落 +' + (reso * MAI_RESO_PER).toFixed(1) + '%')
+                              : ('战力 +' + (reso * MAI_RESO_PER).toFixed(1) + '%');
+        h += '<div class="mai-big">' +
+             '<div class="mai-bh"><b>' + (isL ? b.lmg : b.fr) + '</b>' +
+             '<span class="mai-blv">Lv.' + lv + ' / ' + mx + '</span></div>' +
+             '<div class="mai-be">' + eff + '</div>' +
+             '<div class="mai-be2">共鸣 ' + reso + ' → ' + effReso + '</div>' +
+             '<div class="mai-lock">绑定小节点「' + maiSmallName(rl, sk) + '」每 ' + MAI_SMALL_PER_BIG +
+             ' 级 → 本节点 +1 级（需 ' + ((lv + 1) * MAI_SMALL_PER_BIG) + ' 级）</div>' +
+             '<div class="mai-bb' + (lv >= mx ? ' off' : (pl.n > 0 ? '' : ' off')) + '" onclick="maiUpBig(\'' + b.k + '\',\'' + rl + '\')">' +
+             (lv >= mx ? '需先升小节点'
+                       : (pl.n > 1 ? ('升 ' + pl.n + ' 级 · ' + nStr(pl.cost)) : ('升级 · ' + nStr(c))) + ' ' + resN2) + '</div>' +
+             '</div>';
+      }
+      h += '</div>';
+    });
+    h += '</div>';
+    h += '<div class="mai-tip">当前显示「' + (realm === 'lmg' ? '灵脉' : '凡脉') +
+         '」切顶部『凡脉 / 灵脉』可升级另一界' +
+         '共鸣 = 凡脉与灵脉等级的较小值；' +
+         '共鸣之和 = 顶部共鸣等级，每级给战力与掉落各 +' + MAI_RESO_PER + '%。</div>';
+  }
+
+  body.innerHTML = h;
+}
+
+
+const SUF = (function(){                     /* 生成至 1e306，即常规显示区 */
+  const B = ['','K','M','B','T','Qa','Qi','Sx','Sp','Oc','No','Dc'];
+  const U = ['','U','D','T','Qa','Qi','Sx','Sp','Oc','No'];
+  const T = ['d','Vg','Tg','Qg','Qig','Sxg','Spg','Ocg','Nog','Cg'];
+  for(let g = 12; g <= 102; g++){
+    const k = g - 11;
+    B.push(U[k % 10] + (T[Math.floor(k / 10)] || ''));
+  }
+  return B;
+})();
+function dStr(x){
+  x = _toD(x);
+  if(x.m === 0) return '0';
+  if(!isFinite(x.m)) return '∞';
+  const t = x.e;                                          /* BigInt */
+  const tn = Number(t);
+  if(tn < 0) return '0';
+  if(tn < 6) return Math.round(x.m * Math.pow(10, tn)).toString();
+  if(!S.sci && t <= 309n){                                /* 常规单位区（科学计数法开启时跳过） */
+    const g = Math.floor(tn / 3);
+    if(g < SUF.length) return (x.m * Math.pow(10, tn - g * 3)).toFixed(2) + SUF[g];
+  }
+  if(t < 1000000n) return x.m.toFixed(2) + 'e' + t.toString();   /* 10^310 ~ 10^999999 */
+  const hd = Math.abs(x.m - 1) < 5e-3 ? '' : x.m.toFixed(2) + '\u00d7';
+  return hd + '10^' + bigEStr(t);                         /* 再往上：2.00×10^(1.23e40) */
+}
+function fmtNum(x){ return (x && typeof x === 'object' && x.m !== undefined) ? dStr(x) : nStr(x); }
+function nStr(n){
+  if(n && typeof n === 'object' && n.m !== undefined) return dStr(n);   // 大数对象交给 dStr（科学/单位计数）
+  if(typeof n !== 'number' || Number.isNaN(n)) return '0';    /* NaN 兜底（原误显示为 ∞） */
+  if(!isFinite(n) || n > 1.7976931348623157e308) return '∞';
+  if(n >= 1e6){
+    if(S.sci) return n.toExponential(2);
+    const g = Math.floor(Math.floor(Math.log10(n)) / 3);
+    return g < SUF.length ? (n / Math.pow(10, 3 * g)).toFixed(2) + SUF[g] : n.toExponential(2); }
+  if(Number.isInteger(n)) return n.toString();
+  if(Math.abs(n) >= 100) return (Math.round(n * 10) / 10).toString();
+  if(Math.abs(n) >= 1)  return (Math.round(n * 100) / 100).toString();   /* 1.05 → 1.05（原被舍成 1） */
+  return (Math.round(n * 1000) / 1000).toString();                       /* 0.123 → 0.123 */
+}
+
+/* BigInt 存档序列化：JSON 不认 BigInt，用 \u0001 前缀标记后还原 */
+function bigRepl(k, v){ return typeof v === 'bigint' ? '\u0001' + v.toString() : v; }
+function bigRev(k, v){
+  return (typeof v === 'string' && v.charCodeAt(0) === 1) ? BigInt(v.slice(1)) : v;
+}
+
+/* ============ 状态 ============ */
+const S = {
+  level: 1, kills: 0,
+  hp: D(907), maxHp: D(1103),
+  clicks: 0, totalDmg: null,
+  rebirth: 0, pts: null,
+  atkLv: 0, spdLv: 0, critLv: 0, cdmLv: 0, comboLv: 0, ignLv: 0,
+  fdmLv: 0, ndxLv: 0, psnLv: 0, plcLv: 0,
+  ndxStack: 0, poison: 0,
+  tstone: 0, drawCnt: 0, talents: [],
+  gem: 0,
+      soul: 0,                                          /* 灵魂：每击杀 1 只怪 +1（凡人界产出，灵界「幽冥魂殿」消耗） */
+    soulPact: {},                                     /* 幽冥魂契：{属性k:等级}（上限 SOUL_PACT_MAX=40） */
+    lmgRune: {bag:[], equip:{}, seq:0},               /* 灵界符文：背包 / 镶嵌槽{槽位:符文id} / 自增序号 */
+    incense: null,                                    /* 香火余额（大数，null 视作 0） */
+    incenseLv: {},                                    /* 香火神位：{神位k:等级} */
+    incenseFirst: 0,                                  /* 累计「首次新纪录」次数（仅统计） */
+    lore: {},                                         /* 仙途纪事：{章节k:1} 已解锁章节 */
+    soulBuy: {},                                      /* 幽冥魂市：{资源k:累计兑换份数}（仅统计用） */
+    soulDraw: 0,                                      /* 幽冥魂召：累计抽取次数（仅统计用） */
+  neili: 0,
+  cultDone: 0, brokeCount: 0,
+  secretStage: 1, secretHp: null, secretMaxHp: null, secretKills: 0,
+  secBest: 0,                                       /* 1.90 秘境已击杀过的最高层（重复层内力衰减基准，重置不清） */
+  realm:'fr', lmgUnlocked:false, lmgStone:0, lmgBox:0, lmgPet:{frag:{},owned:{},on:null,cd:{},gcd:{},cutUntil:0}, lmgPetExp:null, lmgPlv:1, lmgPExp:null, lmgPReb:0, lmgPBank:0, cls:null, clsLv:[0,0,0,0,0,0], clsLvAcc:0, clsSkVer:3, clsBr:[], clsActT:[0,0,0,0,0,0], clsActCd:[0,0,0,0,0,0], clsAutoAct:true, lmgPower:0, lmgTicket:0, lmgBossTicketMax:0, lmgTalents:[], lmgAttr:{}, lmgAtkLv:0, lmgHpLv:0, lmgDefLv:0, lmgCultLv:0, cultRealm:0, cultSub:0, lmgLevel:1, lmgHp:null, lmgHpVer:0, lmgHpPct:1, lmgMonHp:null, lmgMonMaxHp:null, lmgMonName:null, inSecret: false, fps: 60, showDmg: true, simpleDmg: false, sci: false, towerDone: 0, towerFloor: 1, inTower: false, towerHp: null, towerMaxHp: null, towerType: 'fr', sbDone: 0, sbResetDay: '', frResetDay: '', shardT: 0, shardL: 0, shardS: 0, weap: {}, box: 0, relicFrag: 0, relics: {}, stHit: 0,   /* 累计攻击次数（凡人界 + 灵界，供「攻速」成就统计） */
+  stLmgK: 0, /* 灵界累计击杀数（成就 lmgK 口径；1.80 起入档） */
+    qd: '', qp: {},
+    setArtiQ: -1, setRuneQ: -1,          /* 拾取过滤（1.42）：-1 = 全部保留 */
+    cloneAutoNext: false, cloneAutoRb: false,   /* 1.56 分身自动化开关 */
+    /* qc（任务领取标记）已废弃：questRollDay 重置、claimQuest 写入，但全代码无读取点，不再初始化 */
+    farmLv: 1, farmStage: 0, farmOpen: 4, plots: [], seeds: [], pills: {}, pillUse: {}, fert: {},
+    relicAd: {}, relicLv: {},
+    stAtkD: null, stPsnD: null, stCrtD: null,
+    stPlant: 0, stFrF: 0, stSbF: 0, stSecK: 0, stLv: 0, stBox: 0, boxPity: 0, stRare: 0, gfLv: {}, petLv: {}, treLv: {},
+    meridian: {},                                  /* 经脉：{经脉k:{lv:[0,0,0], broke:0}} */
+    /* ↓ 以下三项此前仅在运行时动态创建，S 初始定义中缺失，
+         导致 load() 的 hasOwnProperty 检查将它们跳过 → 刷新后成就 / 功法 / 宠物全部丢失 */
+    achClaim: {},                                  /* 成就已领取阶段：{成就k:阶段数} */
+    gongfa: {},                                    /* 已领悟功法：{功法k:true} */
+    pets: {},                                      /* 已拥有灵宠：{宠物k:true} */
+    treasures: {},                                 /* 已拥有宝物：{宝物k:true} */
+    expDay: '', expCnt: 0,                         /* 存档下载：当日日期 / 当日已用次数（每天 3 次） */
+    impDay: '', impCnt: 0,                         /* 存档上传：当日日期 / 当日已用次数（每天 3 次） */
+    bossCnt: {},
+    boss_fatk:0, boss_patk:0, boss_rb:0, boss_cdm:0, boss_psn:0,
+    boss_plc:0, boss_psnadd:0, boss_fdm:0, boss_neili:0,   /* BOSS 通关层数（奖励基数） */                                   /* BOSS挑战：{界k:[8个BOSS的通关次数]} */
+    bossWin: 0,                                    /* 累计通关次数 */
+    inBoss: false, bossWorld: 'fj', bossIdx: 0, bossHp: null, bossMaxHp: null,
+  _t: 0,                                                /* 最后一次有效结算时间戳（离线收益基准，save 每 5 秒推进） */
+  _warn: null,                                          /* 读档时的篡改提示标记（临时状态，不写入存档） */
+    /* 以下 4 项原缺失于初始定义，load() 的 hasOwnProperty 检查会跳过它们 → 真实刷新后丢失 */
+    qt: {},                                             /* 任务完成次数 {任务k: 次数} */
+    petsOff: {},                                        /* 宠物出战关闭标记 */
+    gongfaOff: {},                                       /* 功法停用标记 */
+    titles: {},                                         /* 已获得称号：{称号k:true}（获得后永久被动生效，无需佩戴） */
+    stHarvest: 0,                                       /* 累计收获次数（称号条件用） */
+    titleSeen: true,                                    /* 新获得的称号是否已查看（控制功能按钮红点） */
+    soulAcc: 0,                                         /* 灵魂获取的小数累加器（保证 +10% 这类非整数加成不失效） */
+    /* 1.56 自动转生 / 秘境自动重置：必须在默认 S 里声明，否则 load() 的
+       hasOwnProperty 过滤会把存档里的值静默丢弃，重开后一律退回默认 5 / 30 秒 */
+    autoRb: false,                                      /* 自动转生开关（买了「自在轮回印」后可用） */
+    arbSec: 5,                                          /* 自动转生：N 秒打不死则转生（1~600） */
+    arbStuckTs: 0,                                      /* 上次击杀时刻，用于计算「连续多久没击杀」 */
+    secAutoReset: true,                                 /* 秘境自动重置开关（买了「轮回秘境印」后可用） */
+    secResetSec: 30,                                    /* 秘境自动重置：N 秒打不死则重置（1~600） */
+    secStageTs: 0,                                      /* 秘境当前层起始时刻，用于判定「打不死」 */
+    /* —— 1.56 补：以下字段 save() 已写入，但从未在默认 S 中声明，
+       load() 的 hasOwnProperty 过滤会把存档值静默丢弃，重开即归零
+      （洞府等级 / 法宝镶嵌 / 灵界历史最高关 / 心魔试炼 / 分身零头 等全中招）。
+       在此统一声明，for-in 即可正常读回；load() 末尾的结构收敛照旧生效。 —— */
+    lmgCave: null,          /* 训练洞府 {lv:{}, jade, acc} —— null 让 artiData/caveData 走自身兜底 */
+    lmgArti: null,          /* 灵界法宝 {equip:{}, bag:[], stone, seq} */
+    frClone: null,          /* 凡人界分身零头累计 */
+    pickOpen: {},           /* 设置面板折叠状态 {arti:bool, rune:bool} */
+    cdkUsed: {},            /* 兑换码已使用记录：{码大写:1}（2.21；不声明会被 load() 的 hasOwnProperty 过滤丢弃） */
+    mai: null,              /* 灵脉：整对象入档（1.52 曾修复入档，但读回仍依赖显式处理） */
+    maiPage: 0,
+    lmgMaxLv: 1,            /* 灵界历史最高关（选关范围） */
+    lmgAutoNext: true,      /* 灵界自动推关开关 */
+    lmgTrial: false,        /* 心魔试炼：进行中标记 */
+    lmgTrialWin: 0,         /* 心魔试炼成功次数（属性成长依据） */
+    lmgTrialFrom: null,     /* 进入试炼前的主线层数 */
+    cloneTarget: 'level',   /* 1.56 分身挂机目标：'level' 凡人界关卡 / 'secret' 秘境 */
+    lmgBossFrom: null,      /* 妖王挑战回退点 */
+    snd_bgm: true,          /* 背景音乐开关 */
+    /* 1.58 凡人界深度：三项新增持久化字段（共鸣进度 / 淬炼 / 种子品类），
+       不声明则 load() 的 hasOwnProperty 过滤会把存档值静默丢弃，重开即归零 */
+    gfUp: {},               /* 功法精研层数 {功法k: 0~10} */
+    weapQ: {},              /* 武器淬炼层数 {武器序号: 0~10} */
+    seedKinds: {}           /* 已解锁过的种子种类 {种子序号: 1}（药园共鸣依据） */
+};
+/* ===== 版本号：每次改动递增 =====
+   凡人卷1.25 洞府调整：① 各产线首级免费（Lv0→1 不花灵玉），去掉开局赠送 15 灵玉 ——
+              零门槛起点由「免费首级」承担，不再凭空发钱；第 2 级起按 10×1.15^(n-1) 正常收费。
+              ② 新增 3 条凡人产线（凡人宝物 / 宠物 / 功法），每小时极低概率（每级 +0.004%/时）
+              掷骰，命中后用凡尘宝箱同一套池 —— 越珍贵概率越低，已拥有则走重复突破；
+              概率远低于开宝箱，属长线添头，不冲击宝箱经济。
+   凡人卷1.25 离线上限 2 小时 → 8 小时（聚宝乾坤盆 +2 → 10）。
+   凡人卷1.25 灵界主控条（选关 / 自动推关）在凡人界一律不显示。
+              修复真 bug：renderLmgCtrl() 原挂在 renderLmgArena() 开头，而后者只在 render() 的
+              「realm === 'lmg'」分支里执行 —— 凡人界时根本轮不到它跑，主控条就一直停在
+              灵界那次的显示状态，切回凡人界后选关 / 自动推关仍挂在战斗日志上方。
+              改为同时挂在 applyRealmUI()（切界必走）上，两层兜住。
+   凡人卷1.25 凡人界分身：100 次转生 + 已启灵解锁，按凡人界当前关卡的击杀效率（calcDps / 怪物血量 /
+              攻速上限）估算每小时击杀数，产出 宝石 / 内力 / 灵魂 / 凡尘宝箱。
+              只有主角在灵界时才产出（回凡人界亲自打怪则完全不产出），效率为自己打怪的 35% ——
+              亲自刷永远更划算，分身只是不让凡人界停摆；无离线收益，仅在线每 5 分钟结算。
+   凡人卷1.24 灵界训练洞府：5 条产线（灵力 / 灵石 / 灵魂 / 灵兽经验 / 主角经验）各自独立挂机产出，
+              在线每 5 分钟结算、离线一并结算。自带货币「洞府灵玉」由洞府自己产出（保底 0.6/时 +
+              总等级 ×0.25），升级只花灵玉，与灵石 / 灵力完全分隔，形成「洞府赚钱 → 投回洞府」闭环。
+              投资模型：成本 10×1.15^等级 指数增长、产出线性增长 —— 边际成本/产出随等级上升，
+              存在最优停点，不是无脑点到底；等级无上限，想无限投就无限投。
+              首启赠 15 玉（保底产率下从 0 攒到第一级要挂 16 小时，开局即死锁）。
+   凡人卷1.28 测试可达性：DEV 悬浮按钮原先只在 renderSettings() 里才显示 —— 必须先打开一次
+             「设置」面板才看得到，测试时极易误判为「这版没有开发者模式」，改为启动即按 DEV_MODE 决定；
+             设置面板内另加一条「开发者调试」入口（悬浮按钮在部分机型会被安全区 / 工具栏遮挡）。
+             开发者面板新增「一键启灵」（转生补至飞升门槛并直接进入灵界）与「魂契全满 / 清零」，
+             devRebirth 提示补上「当前次数 / 门槛」。以上均受 DEV_MODE 守卫，正式版不出现。
+             修复：幽冥魂殿首次打开内容为空 —— renderSoulShrine() 有「面板未显示则 return」的守卫，
+             openSoulShrine() 却先 render 再 add('show')，守卫把它挡掉了；改为先 show 再 render。
+   凡人卷1.56 便捷性调整：
+     · 成就体检：22 项逐一实测，全部生效（此前无系统性校验，今补常驻测试）。
+     · 修复称号「初结善缘」（拥有 1 只灵宠）永不达成：凡人界 petOwn() 与灵界 petOwn(k)
+       完全同名，函数声明提升导致后者覆盖前者，凡人界调用返回 null，null >= 1 恒为 false。
+       凡人界侧改名 frPetOwn()、灵界侧改名 lmgPetOne()，两套体系彻底分离；
+       灵界「灵兽初契」同样受影响，改用 lmgPetOwnN()。
+     · 离线兑换成本下调：离线 2 小时 → 1 小时，在线 1 小时 → 0.5 小时。
+     · 兑换的二次确认由独立浮层改为【紧贴兑换按钮下方】的内联提示条，视线不跳转。
+     · 药园新增化肥快捷条：不必绕到背包，播种后顺手即可催熟所有地块。
+     · 新增遗物 6 件（5 → 11）：洞玄（暴击率）/ 流光（攻速）/ 连环（连击率）/
+       破甲（破防）/ 纳灵（内力）/ 聚宝（凡尘宝箱），补上此前完全空白的乘区。
+     · 分身新增【自动推关】【自动转生】两项开关，只作用于凡人界；
+       转生走独立的后台结算，不会把正在灵界挂机的玩家踢回凡人界。
+     · 自动转生开关只在凡人界显示（转生是凡人界机制，灵界显示无意义）。
+     · 兑换面板文案全部改为动态读取：按钮上的「消耗 N 小时」与单次 / 在线 / 库存上限
+       原先在 HTML 里写死（2 / 1 / 4 / 8 / 6），改了成本、买了宝物后数字对不上。
+     · 新增通用暗金按钮样式 .gbtn：分身的【自动推关】【自动转生】此前用了不存在的类名，
+       浏览器无样式可用而渲染成白色原生按钮。今后新功能按钮一律用 .gbtn，杜绝此类割裂。
+     · 洞府大幅加强：产出由 base × 等级（纯线性）改为 base × 等级 × 等级成长系数
+       （每满 30 级翻倍），各产线 base 上调 50%，灵玉保底 0.8→1.2、总等级系数 0.3→0.5。
+       实测 Lv.30 产出 ×3.00、Lv.100 ×6.50。
+     · 修复分身产出恒为 0：自动推关的上限原为「历史最高关 stLv」，而凡人界怪物血量指数增长
+       （第 2333 关已达 9.2e62），推得越高怪越硬 —— 实测第 1 关击杀 3571/时，
+       推到 stLv 后仅 1.94e-55/时（面板 floor 成 0），相差 1.8e58 倍。
+       改推至「min(stLv, 转生线)」：到线即转生回第 1 关，产出始终最大化。
+     · 分身的【自动推关】【自动转生】改为开启即执行一次：原只在 5 分钟 tick 里做，
+       玩家开了开关要干等 5 分钟才见动静，极易误判为「没生效」。
+     · 分身面板击杀数不再 Math.floor 成 0：极小值改显科学计数并标红「打不动」，
+       同时说明「关卡越高怪越硬」，避免玩家误以为功能失效。
+     · 分身推关改为【每秒平滑推进】：原实现只在 5 分钟 tick 里跳一次，中间关卡数字纹丝不动。
+     · 修复分身推不到转生线：比例推进（每次推剩余量的 hrs/4）在剩余量小时 steps 恒为 0，
+       关卡卡在转生线前几关处再也不动，自动转生永远触发不了。现设最小步长 CLONE_PUSH_MIN_STEP。
+     · 分身面板在开着时随推进实时刷新。
+     · 修复删档新档分身完全不动：推关上限原为 min(stLv, 转生线)，而新档 stLv=1 ——
+       取小后上限即 1，from >= stLv 直接 return null，表现就是「开了开关毫无反应」。
+       改为以转生线为准，推过历史最高时同步抬高 S.stLv。
+     · 分身击杀接入香火「疾神·多杀」：单次攻击溢出伤害连斩（与主线 killBoss 同口径），
+       受 multiKillCap() 约束，且不超过理论上限 DPS÷血量。
+       实测疾神 Lv.0 ×2.00、Lv.10 ×12.00、Lv.100 ×102.00。
+       注意：多杀只在「伤害溢出」时触发，关卡高到打不动时仍为 1 只 —— 那种情况靠自动转生回落关卡。
+     · 清理残留文案：聚宝乾坤盆「离线收益时长上限 2→4 小时」（离线已改为只收集时间，
+       实际为 8→10 小时）、分身面板「每 5 分钟结算」（推关已改每秒）。
+     · 1.56 继续清理功法 / 灵宠的「激活 / 停用 / 休息」残留：
+       ① 功法弹窗顶部「可在此停用 / 再启用」→「购买后永久被动生效（无需启用）」
+       ② 宠物弹窗顶部「可在此休息 / 再出战」→「购买后永久被动生效（无需出战）」
+       ③ 商店内功法 / 宠物条目描述后缀「可在「功法」面板查看 / 停用」「……查看 / 休息」整段删除
+       ④ 宝箱稀有掉落提示「已自动启用」→「已永久生效」
+       ⑤ toggleGongfa / togglePet 降为纯刷新（旧档可能残留 onclick，不再弹冗余 toast）
+       ⑥ load 中 gongfaOff / petsOff 的初始化死代码移除（两字段已在下方统一清空）
+     · 化肥由「离线兑换附赠的隐形效果」改为【背包物品】：草木肥 / 灵泉肥 / 玉髓肥 /
+       星陨肥 / 造化肥（10 分 ~ 4 小时五档），秘境掉落，品质越高越难得；
+       背包「辅助」分类中点击即用，缩短所有已播种地块的成熟时间。
+     · 背包分类重做为 种子 / 丹药 / 辅助 三类（遗物不在背包显示）；
+       药园不再显示灵丹区，丹药统一在背包查看。
+     · 塔跃层宝物修正：原仅进入塔时跳一次，改为【每次击败都跳】——满四件每次 +100 层。
+     · 遗物新增一键升级：单卡「一键升满」与面板「一键升级全部」，后期不必逐级点。
+     · 自动转生开关：购买宝物「自在轮回印」后主界面显示开关（默认关），
+       此前买了就永久生效、无法关闭。
+     · 凡人天赋石消耗大幅下调：原第 N 次需 N 枚，改为每 10 次才 +1 枚（第 101 次仅 11 枚）。
+     · 新增「神话」品质天赋 6 个（权重 0.25，超级难抽），天赋总数 54 → 60。
+     · 顶栏资源统计：移除天赋石，新增 香火 / 矿石；灵界时整行改为 灵力 / 灵石 / 灵魂 / 灵蕴，
+       不再显示凡界资源。
+   凡人卷1.55 便捷性调整：
+     · 修复真 bug：宝物「洞玄天眸」（4000 万宝石）的暴击伤害 +300% 自加入以来从未生效 ——
+       calcCritDmg() 未接入 treSum('cdm')，买了等于白扔。今已补回。
+     · 修复真 bug：功法「连环剑诀」（连击率 +150%）自加入以来从未生效 ——
+       calcCombo() 未接入功法加成。今已补回。
+     · 全面体检：功法 9 个乘区、宠物 11 个、宝物 15 个、称号 14 个，共 49 个乘区
+       逐一实测均有值；19 只灵兽被动逐只校验全部生效（pct 类走 petPasPct）。
+     · 离线兑换弹窗：文字整体放大（说明 10.5px → 13.5px），两枚兑换按钮改为竖排各占整行，
+       主标题与副标题各占一行，彻底避免窄屏下文字互相挤压、说明被截断。
+     · 辅助类功法原仅「金刚不坏」一本，现补至七本：内力获取（聚灵诀 / 纳灵大法 / 万灵归元）
+       与凡尘宝箱产出（探囊取物 / 乾坤妙手 / 造化聚宝诀）两条线各三档。
+     · 毒类灵宠原仅「碧毒蟾王」一只，现补至五只：瘴气灵蛇 / 腐骨毒蝎 / 幽泉毒蛟 / 万蚀毒尊，
+       毒伤害与毒层上限双线成长。
+     · 修复真 bug：连环剑诀（连击率 +150%）自加入以来从未生效 —— calcCombo() 未接入功法加成，
+       买了一本等于没买。今已接入，实测连击率 0 → 150。
+     · 功法 / 灵宠取消「停用」「休息」—— 购买后一律被动永久生效，界面不再显示切换按钮；
+       旧档残留的 gongfaOff / petsOff 标记于读档时清除，已购者全部恢复生效。
+     · 新增塔跳关宝物八件：凡人塔与神兵塔各四件（+10 / +20 / +30 / +40），
+       两塔互不通用，买满一塔可一次性跳过一百层。中等价位（300 万 / 800 万 / 2000 万 / 5000 万）。
+     · 离线兑换（2 小时）在「直跳历史最高关 + 2 小时资源」之外，另附化肥 2 小时，
+       可直接缩减荒田各地块的成熟时间。
+     · 商店内部分类重做：功法 / 宠物 / 宝物三类下增设「全部 / 攻击 / 毒 / 辅助」子页签，
+       点击后只显示该类，不再把所有分组堆在同一列表。
+   凡人卷1.54 离线系统重做（时间货币化）：
+     · 离线不再直接发放资源、不再自动推关，改为收集「离线时间」；
+       在线挂机亦累积「在线时间」（灵界在线同样累积）。
+     · 单次离线收集上限 4 小时，宝物【聚时沙漏 +1 / 流光玉壶 +3 / 须臾乾坤鼎 +4】→ 12 小时。
+     · 在线时间上限固定 8 小时。时间库存上限 6 小时，宝物
+       【蓄时玉皿 +1 / 纳时宝囊 +3 / 时序金轮 +6 / 刹那永恒塔 +8】→ 24 小时，两者共用。
+     · 新增「离线兑换」：离线时间 2 小时 → 直跳历史最高关 + 2 小时资源；
+       在线时间 1 小时 → 仅直跳最高关，不给资源。
+       资源按历史最高关的 50% 折算，并随【跳过的关卡数】以平方根放大
+       （跳 100 关 ×1.26、1000 关 ×1.83、10000 关 ×3.63，前期少、后期明显多）。
+     · 已在最高关时兑换会二次确认，只发资源不跳关。
+     · 灵界离线结算维持原样不变。
+   凡人卷1.53 凡人界离线推关：
+     · 离线期间凡人界主线自动推进，上限为【历史最高关 stLv】—— 只推已通关之处，
+       绝不越线，故不影响转生币口径（转生币只与 stLv 相关）。
+     · 资源、掉落等一律维持原算法，不多给不少给；推关只省操作，不给额外收益。
+     · 速率按历史最高关比例：每小时推 stLv/8 关（FR_PUSH_FULL_HOURS = 8），
+       即离线满 4 小时恰好推到最高关。与实际战力无关，只与自身进度成比例，
+       故前期不会飞快、后期不会停滞。
+     · 已在最高关、或在灵界在线时，均不触发。
+   凡人卷1.52 修复：
+     · 【灵脉系统此前完全未入档】—— 旧版 save() 只写入 ore / ly 两个数值，
+       而 load() 连这两个都未读取，致使小节点等级、大节点等级、共鸣、
+       矿脉占领与刷新计数，重开游戏后全部归零。今改为整个 S.mai 对象入档，
+       并兼容旧档（无 mai 字段者以 ore / ly 兜底，子结构由 maiData() 补齐）。
+     · 拾取过滤之折叠状态（S.pickOpen）此前亦未入档，今一并持久化。
+   凡人卷1.51 妖魔与天赋调整：
+     · 妖魔命中大幅加强：150 + 8×层 → 600 + 30×层（第1000关 8142 → 30570）。
+     · 妖魔闪避中幅加强：每关 1.1 → 1.6（第1000关 1100 → 1599）。
+     · 妖魔减伤（即妖魔防御）中幅加强：0.0035/关 → 0.005/关，封顶 45% → 55%。
+     · 妖魔攻击中幅加强：35 + 5×层 → 45 + 7×层（第1000关 5035 → 16891）。
+     · 妖魔攻速【新增】：旧为硬编码 1500ms（≈0.67 次/秒）且不随关卡成长；
+       今改为随层数提升并封顶 5 次/秒（第1关 0.67 → 第1000关 3.67 → 封顶 5）。
+       实现上改用「固定 100ms tick + 累积计时」，攻速变化无需重启定时器。
+     · 修真突破消耗大幅提升：base ×10、成长指数 1.8 → 1.95（注：此处扣的是灵魂）。
+     · 灵天赋中幅削弱：单次加成 ×0.7（LMG_TAL_NERF）。
+     · 灵天赋可重复抽取升级：S.lmgTalents 由「字符串数组」改为「等级表」，
+       重复抽到即 +1 级，加成随等级放大；老档（数组）自动迁移为 Lv.1。
+       面板于已获得之天赋上直接标出「实得：攻速 +2100%」等实际生效值（已含削弱与等级），
+       不再只印写死的原始描述，以免玩家误以为削弱未生效、重复抽取无用。
+     · 【灵界】攻速小幅度削弱：各来源加成统一 ×0.85（LMG_SPD_NERF）。
+       修炼 spd Lv.1000 由 11.00 次/秒 降至 9.50 次/秒。
+     · 灵天赋之攻速原始值大幅下调（方案 A）—— 原 Lv.1 实得即撞攻速封顶，
+       致「重复抽取升级」对攻速天赋完全无效（实测 Lv.1~Lv.9 攻速恒为 2.28）：
+         灵速·微 30→12　灵速·初 80→25　灵速·中 180→60
+         灵速·高 400→100　灵速·极 1000→200　灵道无极 800→150
+       灵天赋攻速封顶同步由 150% 提高至 400%，留出升级空间（极 Lv.3 撞顶）。
+     · 【灵界】攻速各来源皆设硬上限：灵天赋 400% / 修真 200% / 转生 500% /
+       修炼 1000%（等级上限 1000）/ 灵兽 100% / 灵脉 150% /
+       魂契·法宝·羁绊·符文·成就·里程碑 合计 300%；理论上限约 23.5 次/秒。
+       （凡人界攻速不受影响。）
+   凡人卷1.50 灵界属性平衡（方案 A）：
+     1.44 曾将「灵界攻击」base 由 20万 下调至 200（÷1000），然
+       「防御 / 穿透 / 闪避 / 命中」之 base 与符文 / 魂契 / 灵天赋所给之点数皆未同步缩放，
+       遂使点数相对 base 放大约千倍 —— 同等级之下防御类数值反超攻击数倍（攻 10万 / 防御 40万）。
+     今设 LMG_FLAT_SCALE 统一缩放此三条点数通道（默认 0.2）：
+       有效 base 由 800 降至约 176，def/atk 由 4.0× 降至约 0.9×，二者回归同量级。
+   凡人卷1.50 数值调整：
+     · 法宝 / 符文背包上限由 30 件降为 20 件。
+     · 法宝与符文之高品质掉落率再降（高阶惩罚 0.5 → 0.35）：
+       凡品约 68%、灵品 22%、玄品 7%、神品 2%、仙品 0.5%。
+     · 灵界修炼之固定类「防御 / 穿透 / 闪避 / 命中」每级加成由 +1% 下调至 +0.5%，
+       「暴击伤害」由每级 +1 下调至 +0.5 —— 此五项改由灵脉小节点承担成长。
+     · 灵界连击率改为 100% 封顶（最多 1 段必连），不再无限堆叠。
+     · 灵界资源组「灵力汲取 / 灵石寻获 / 灵魂感悟」每级加成由 +1% 提高至 +3%。
+     · 洞府灵玉产出小幅加强：保底 0.6 → 0.8 / 时，总等级系数 0.25 → 0.3。
+   凡人卷1.49 灵脉系统（新增）：
+     占领矿脉 → 产矿石 / 灵蕴 → 升级世界图节点 → 掉落与战力加成。
+     凡人界「凡脉」产矿石，灵界「灵脉」产灵蕴；矿石养凡界节点，灵蕴养灵界节点。
+     节点分两层，且一一绑定 —— 小节点每升 10 级，其绑定的大节点方可升 1 级：
+       · 小节点 —— 无上限，成本递增，给属性。凡人界七项（攻击 / 血量 / 暴击 / 暴伤 /
+         终伤 / 毒伤 / 破防），灵界七项（攻击 / 血量 / 防御 / 命中 / 暴伤 / 穿透 / 闪避）。
+         灵界不设「攻速」节点（攻速另有封顶与固定基准，不宜再开成长口子），
+         亦不设「暴击率」节点（暴击率硬顶 100%，升满即废）。
+       · 大节点 —— 1000 级封顶，凡界版与灵界版配对，共七对。单界点亮即给该界对应项加成；
+         两界配对产生「共鸣」，共鸣是战力与掉落的主要来源。
+     共鸣 = 所有大节点配对等级之和（满额 7000 = 7 对 × 1000），每 1 级给战力与掉落各 +0.2%。
+     刻意不含「灵天赋抽奖券」节点。
+     矿脉：每满 24 小时重新随机凡矿 / 灵矿各 6 处，占领随之清除、需重新挑战。
+     品质（凡→仙）与等级均随机，越高越稀有；等级上限 = 最高关 ÷ 10。
+     占领须先击败守卫 —— 凡矿用凡人界战斗，灵矿用灵界战斗。
+     守卫血量 = 该界第（矿等级 × 10）关怪物血量 × 品质倍率（凡 1 至仙 16），
+     守卫攻击 = 本界血上限的比例 ×（1 + 等级 × 5%），每二息反击一次。
+     等级越高越强、品质越高越强，二者叠加则极强的（仙品 Lv.30 守卫血量以 T 计）。
+     每界同时只可占领一处；挑战新的即放弃旧的（未领产出先行结算，不使道友白等）。
+     可用宝石（凡）/ 灵石（灵）刷新矿脉品质与等级，价格每次 ×1.6，每 24 小时重置；
+     手动刷新同于放弃当前占领。
+     产出累积上限 8 小时，可随时手动领取或一键领取。
+     矿脉按品质分五色：凡灰、灵蓝、玄橙、神紫、仙红。
+     灵脉面板分「矿脉 / 小节点 / 大节点」三页显示，并设关闭按钮。
+     灵界不再显示凡人界属性面板，亦不再显示底部「属性 / 战斗」导航；
+     两界功能按钮重新排布，每行排满，不再有孤零零的单个按钮。
+     洞府新增三条产线：
+       · 【灵　玉】—— 以洞府灵玉升级、产出洞府灵玉本身。往日灵玉只由「总等级 ×0.25」
+         被动产出，开局仅 0.6/时，甚是迟缓；今有此线，可主动投资以加速。
+       · 【凡脉·矿石】【灵脉·灵蕴】—— 以洞府灵玉升级，每小时产出灵脉养成资源，
+         与矿脉占领产出同源同上限，纵然一处矿脉未占，灵脉亦有缓慢的成长之源。
+     灵脉面板之大节点，改为凡脉与灵脉各成一页，切换顶部「凡脉 / 灵脉」查看，不再同屏并列。
+     灵界小节点「灵·攻速」改为「灵·命中」—— 攻速已另有封顶与固定基准，不宜再开成长口子；
+     命中则决定「对妖魔的有效命中率」，投之可见实效。
+     同时修正：灵界小节点之「防御 / 穿透 / 闪避 / 命中 / 暴击 / 暴伤」六项
+     原先未接入灵界属性计算，点了不生效，今已一并接入。
+   凡人卷1.48 成就与称号体系扩充（总计 300）：
+     新增灵界 / 新系统成就 9 项（灵界最高关、灵界击杀、心魔通关、修真境界、魂契、
+     符文、法宝、灵兽、纪事），成就由 13 项 130 阶段扩为 22 项 220 阶段。
+     新增称号 25 枚（启灵、魂契、符文、法宝、心魔、灵兽、修真、丹药、魂市等），
+     由 55 枚扩为 80 枚；成就 220 + 称号 80 = 满额 300。
+     新增「万古长青榜」全局里程碑 8 档：以「成就阶段 + 已获得称号」合计计数，
+     奖励同时提升凡人界掉落与灵界战力，两界都有收益。
+     「累计攻击次数」成就改为凡人界与灵界都计入 —— 灵界挂机是该成就的主要来源，
+     原先只统计凡人界，飞升后几乎不涨，后 4 阶段形同虚设。
+     修复：老档首次启动只补发 1 个称号时红点不亮（加成本已生效，却显示未激活）——
+     原逻辑仅在「补发多于 1 个」或「非静默巡检」时才点亮红点，恰好漏掉这一种。
+     幽冥魂市单价改为递增：每兑换 1 份，下一份单价 ×1.08；基准单价上调、
+     单份产出下调（原 150 灵魂换 300 灵石明显偏高），连买按几何级数计价。
+     顶栏宝石与「宝石不足」提示改为缩写显示，不再输出一长串 0；
+     商店类目（道具 / 种子 / 灵宠 / 功法 / 宝物）与荒田地块的价格同样改为缩写。
+   凡人卷1.47 仙途纪事小说化：
+     57 章正文全部重写为小说体，由平均 43 字扩至平均 454 字（最短 362 / 最长 538），
+     全书约 2.6 万字，分段排版，有场景、动作、对话与心理描写。
+     故事线贯通：破庙拾卷 → 老周授艺（独眼瘸腿，三年而别）→ 练体二十境 → 四次破境
+     → 千关 → 百转 → 飞升 → 灵界诸缘 → 修真九境 → 渡劫九重 → 终章回到破庙听雨。
+     三条伏笔贯穿全书并收束：
+       · 破庙（起点与终点，终章你蹲回佛像后听雨）
+       · 老周（师徒两人都不会告别；五劫清算时重逢，他说「我也没给你送终」）
+       · 雨（开篇「雨到后半夜才停」，终章「雨总会停的」）
+     搭配的 UI 改动：
+       · 弹窗正文限高 52vh 可滚动，避免长文撑出屏幕
+       · 列表内正文默认收起为 3 行，点「展开全文」再完整显示（否则 57 章会把面板撑成几千行）
+   凡人卷1.46 拾取过滤改横版折叠 + 高阶掉落下调 + 血量跨版本迁移：
+     ① 设置「灵界拾取过滤」改为横版折叠：法宝 / 符文各占一条横栏，点击标题展开，
+        选项横向排列；标题右侧回显当前选择。折叠状态存 S.pickOpen，重开面板保持。
+        （原为两组各竖排 6 个按钮，占竖向空间过多。）
+     ② 法宝高品质掉落率下调：新增「高阶惩罚」ARTI_QW_HIGHPEN = 0.5，
+        品阶每高一档权重再乘 0.5。原公式只有低阶衰减，导致 maxQ=4 时高阶概率偏高。
+        实测（仙品可达时）凡 55.8% / 灵 25.8% / 玄 11.6% / 神 5.2% / 仙 1.3%
+        （改前：神 18.8% / 仙 10.4%）。
+     ③ 灵界血量跨版本迁移：hp base 在 1.44 由 100 万降到 1000，老档存的绝对值会超上限。
+        现同时存档「血量占上限的百分比」lmgHpPct + 版本标记 lmgHpVer：
+        · 新档 → 按百分比还原（精确，以后再改 base 也不会丢比例）
+        · 老档（无 lmgHpPct）→ 用旧公式反推旧上限算出比例，再套新上限
+        · 已迁移档（lmgHpVer 匹配）→ 只走百分比，绝不重复缩放
+        实测：老档 60% 血 → 迁移后仍是 60%；满血仍是满血。
+   凡人卷1.45 妖魔血量改为幂函数（k=1.5）：
+     血量 = 1000 + 150 ×(层数-1)^1.5　（原为线性 250 + 4500×层数）
+     · k=1.5 > 1 → 每关增量随层数递增，越推越难（k=1 时等价线性）
+     · 第 1 关 1000（开局攻击 200 点 → 需 5 击，不再是秒杀）
+     曲线实测：第10关 5,050　第50关 52,450　第100关 148,756
+               第200关 422,086　第500关 1.67M　第1000关 4.74M
+     每关增量：150 → 693（第10关）→ 2,244（第100关）→ 5,029（第500关）→ 7,113（第1000关）
+     对比线性（恒定 4,500/关）：前 100 关明显更松，第 500 关附近追平，之后反超。
+     参数集中在 LMG_LIN：monHpBase（基数）/ monHpAdd（C）/ monHpK（形状）。
+     血量计算仍只有 lmgMonHpFor 一个来源，不存在第二份数据。
+   凡人卷1.44 灵界攻击基数大幅下调：
+     ① 灵界攻击 base 200000 → 200（降 1000 倍），每级 +1% 的绝对增量由 +2000 点变为 +2 点。
+     ② 灵界血量 base 1000000 → 1000（同比例降 1000 倍，保持 atk : hp 比例不变）。
+     ③ 妖魔血量基数 300 → 250、妖魔攻击基数 42 → 35（「下调一点点」）；
+        每关增量 monHpAdd 4500 与 monAtkAdd 5 保持不动 —— 血量曲线仍为线性（C 计划）。
+     ★ 实测影响（裸档，无任何其它加成）：
+        攻击 Lv.0 = 202 点、Lv.100 = 402、Lv.1000 = 2202；
+        第 1 关怪血 250 → 需 2 击；第 10 关 40750 → 需 184 击；第 100 关 445750 → 需 1110 击。
+        即当前配置下【连第 1 关都无法一击秒杀】，推关基本停滞 —— 已按「不用管能不能推得动」执行。
+        若需恢复可玩性，最小改动是同步下调 monHpAdd（如 4500 → 50~200），
+        或把 atk base 提到 2000~20000 档位。
+   凡人卷1.43 修炼统一每级 +1% + 节奏与掉落调整：
+     ① 修炼全部改为「每级 +1%」（含攻速，百分点类 = 每级 +1 个百分点），
+        且等级给的百分比【并入加法池】（与修真/转生/符文/魂契同池相加），不再是独立因子。
+        ★ 关键：每级由 30% 降到 1%，若 base 不动会陷入死亡螺旋（实测 1 小时只能推到 73 关），
+          故同步提高 base —— atk 10000→200000、hp 50000→1000000，
+          使「每级 +1%」的绝对增量（+2000 / +10000 点）与旧点数制同量级。
+        实测 1 小时可推到约 1050 关，持续推进不卡死。
+     ② 灵力需求小幅下调：base 500→380、k 1.25→1.18（资源组 1200→900）。
+     ③ 妖魔血量下调 25%：每关 +6000 → +4500（攻击 +8 → +5）。
+        配合每级 +1%，玩家可以「卡在某关反复刷、攒灵力升级再突破」，不必一直推关。
+     ④ 掉落大幅削减：法宝必掉→20%、符文必掉→15%、灵天赋券 35%→4%（洗练石仍必掉）。
+     ⑤ 心魔加强：血量底数 3000→8000、成长 1.30→1.45；攻击 40→90、成长 1.26→1.40；
+        等效层步长 2→4。心魔成为法宝/符文的主要稳定来源，故必须更难。
+     ⑥ 魂契与修真所需灵魂大幅提高：魂契 base×2→×60、k 1.5→1.8（首级 600→18000，
+        10 条全满约 2.04B）；修真 base 2万→80万、k 1.5→1.8（首次 2万→80万）。
+     ⑦ 修炼卡片新增「×10 / MAX」按钮。
+        ★ 实现要点：lmgUpCost 读的是当前等级，必须逐档临时推进再取价，
+          否则连升 10 级只扣 1 级的钱；灵力不足时停在能负担的最后一级，而非整笔失败。
+   凡人卷1.42 灵界修炼百分比化 + 拾取管理：
+     ① 修炼每级改为「加百分比」而非固定点数：值 = base×(1+每级%×等级/100)×(1+各系统%池)
+        atk/hp 各 +30%/级（base 取 10000/50000，与旧点数制偏差仅 1~4%，怪物血量无需调整）
+        def +40% / pen +32% / dodge +14.3% / hit +3.33% / spd +0.5%（均由旧点数换算）
+        ★ 关键点：等级百分比是「乘在 base 上」的独立因子，不塞进加法池 ——
+          若塞进池子，等级越高其它系统的百分比越被淹没（实测 def 转生 500% 只涨 12%）。
+        pen / dodge / hit 也一并享受百分比池（旧版只有 def 有池，后期会被稀释）。
+        卡片上直接标出「每级 +N%」，便于与符文 / 魂契的 % 口径对照。
+     ② 拾取上限：符文 / 法宝背包各限 30 件，满了不再拾取。
+     ③ 设置新增「灵界拾取过滤」：可为法宝 / 符文分别设定品阶门槛，
+        低于该品阶的掉落就地自动分解（法宝→强化石，符文→符文碎片），不浪费也不占包。
+     ④ 法宝分解给强化石（原「洗练石」，与面板文案统一）；分解收益抽为 artiMeltVal 共用。
+     ⑤ 符文新增「分解」：得符文碎片（凡1/灵2/玄4/神8/仙16，与当狗粮同价，故不吃亏）；
+        碎片可直接喂给任意符文（1 碎片 = 1 点）。已镶嵌的符文不允许分解。
+     ⑥ 一键吞噬由「只吞凡品」扩展为「按品质选」（凡/灵/玄/神/仙五档）。
+   凡人卷1.41 灵界成本曲线：指数 → 幂函数：
+   凡人卷1.41 灵界成本曲线：指数 → 幂函数（前高后缓）：
+     1.40 的指数曲线后期失控：修炼 Lv.1000 单价 5.34Dd，修真与香火还先后撞上 SAFE_INT
+     被夹死在 9.01Qa（单价不再增长，形同虚设）。现全部改为幂函数 cost = base×(等级+1)^k：
+       · 幂函数增长率随等级递减，后期天然平缓，不会像指数那样爆炸
+       · base 抬高，前期不至于一点就升满（「前期需求多一点点」）
+     参数集中在 LMG_COST：plv{600,1.25} up{500,1.25} upR{1200,1.25}
+                        pact{mul2,1.5} cult{20000,1.5} inc{mul2,1.5} rune{3}
+     实测对照（新 vs 旧）：
+       主角经验 Lv.100  22.4M → 189,737　　Lv.200  1.87T → 451,272
+       修炼  Lv.500  1.03Sx → 1.19M　　　Lv.1000 5.34Dd → 2.82M
+       魂契  10 条全满 171.62T → 25.05M 灵魂
+       修真  第 40 次 9.01Qa → 5.06M
+       香火  战神 Lv.999 9.01Qa（卡死） → 1.26M　　符文满级累计 660 → 135 点
+     前期确实更贵了（主角 Lv.20 由 2,584 升到 25,377；修炼 Lv.10 由 473 升到 10,016），
+     中后期大幅下降。注意：修炼 Lv.1000 由「遥不可及」变为「可达成」（累计约 3.4e8 灵力），
+     若仍希望攻速 1000 级保持长期目标，单独调高 LMG_COST.up.k 即可。
+   凡人卷1.40 灵界全系统资源再涨价：
+   凡人卷1.40 灵界全系统资源再涨价（含主角升级经验）：
+     · 主角升级经验：线性 100×等级 → 指数 300×1.12^(等级-1)
+       （Lv.20 2.6e3 / Lv.50 7.7e4 / Lv.100 2.24e7 / Lv.200 1.87e12 —— 1.38 时暂未加价，本次补上）
+     · 修炼升级成本 1.05^lv → 1.09^lv（Lv.500 由 7.86T 升到 1.03Sx，Lv.1000 由 3.1e23 升到 5.34Dd）
+     · 魂契成长 1.55 → 1.85（10 条全满累计由约 3e12 升到 1.72e14 灵魂）
+     · 修真突破 2.5 → 3.2（第 40 次突破升到 9.01Qa，已触及 SAFE_INT 夹顶）
+     · 香火神位斜率 1.08/1.12/1.18 → 1.12/1.16/1.22（Lv.100 级由 1.9e5 升到 1.67M）
+     · 符文喂养需求再提（满级 Lv.10 累计由 385 点升到 660 点）
+     注意：成本被 SAFE_INT（约 9.01e15）夹住的系统，其单价会停在 9.01Qa 不再增长，
+     但香火等使用大数存量的系统仍可继续升级（只是每级都是这个天价）。
+   凡人卷1.39 攻速不再吃主角等级加成：
+     主角等级上限 plvCap() = 100×(重修次数+1)，而重修可无限重复 → plvBonus 无上限。
+     攻速若吃它就会无限增长（实测重修 100 次即 112 次/秒），虽被 LMG_APS_CAP=50 硬夹，
+     但面板会显示 112 而实际只打 50，玩家会觉得数值对不上。
+     现从攻速乘区移除 plvBonus()：主角等级改为只增益攻击 / 血量 / 防御等其它属性。
+     实测重修 0 / 1 / 20 / 100 / 1000 次攻速恒为 25.01 次/秒，完全不再受重修影响；
+     同时确认 atk 仍随主角等级成长（重修 20 次：9.50M → 15.80M），其它属性不受影响。
+     攻速现由四条有上限的来源构成：基础 1.0 + 转生(封顶500%) + 修炼Lv.1000(+500%) + 修真/魂契等。
+   凡人卷1.38 灵界攻速重做 + 全系统资源涨价：
+     ① 攻速基础值 4.0 → 1.0，并新增两条独立成长线：
+        · 凡人界转生：每转 +1%，封顶 +500%（转生 500 次达顶，其它属性仍无上限）
+        · 攻速修炼：等级上限恢复为 Lv.1000，每级 +0.5%，满额 +500%
+        两条都是「百分比」而非点数 —— 基础值仅 1.0 次/秒，若按点数加会被基数稀释、玩家无感。
+        攻速不再是「1.37 版的不成长」，而是变成两条都有明确上限的百分比线。
+     ② 灵界全系统资源需求大幅提高（用户要求「海量资源、当前版本无法完成」）：
+        · 修炼升级成本：线性 50+120×lv → 指数 200×1.05^lv
+          （Lv.100≈2.6e4、Lv.300≈4.6e8、Lv.500≈7.9e12、Lv.1000≈3.1e23）
+        · 魂契成长 1.28 → 1.55　香火三段斜率 1.055/1.075/1.100 → 1.08/1.12/1.18
+        · 修真突破 1.9 → 2.5　符文喂养需求改为二次增长（满级累计 45 → 385 点）
+        主角经验暂不加价，避免与修炼成本叠加过头。
+        注意：修炼成本改回指数与 1.34「改线性防卡死」的取舍相反 —— 本次是刻意放缓，
+        把高等级做成长期目标；指数成本不会让属性数值膨胀，只拉长达成时间。
+   凡人卷1.37 灵界攻速不再随修炼等级成长：
+     原为 base1.0 + 0.1×等级、Lv.100 封顶 → 裸值 2.0 → 22.1 次/秒（11 倍），成长过快，
+     且攻速与攻击力叠乘会让推关速度失控（攻速既是乘区又会因等级自我放大）。
+     现改为固定基础值（add=0），成长全部交给其它系统：
+     符文 / 魂契 / 灵兽被动 / 灵天赋 / 丹药 / 转生的百分比加成照常生效。
+     固定值取原曲线中段（LMG_LIN.spdBase = 4.0）：裸约 8.0 次/秒、满魂契符文约 16.0 次/秒。
+     实测 Lv.0 / 30 / 60 / 100 四个档位攻速完全一致，确认不再随等级变化。
+     老档处理：玩家此前投在攻速上的灵力全额退还（按 lmgUpCost 逐档累加），等级归零。
+     修炼面板里该行显示为「固定 · 不随等级成长」，且上限设 0，不会再吞灵力。
+     想再调快慢只改 LMG_LIN.spdBase 一个数。
+   凡人卷1.36 灵界数值整体收缩：目标不是平衡，而是「让灵界修炼很快撞墙，玩家转去练别的」。
+     · 每级攻击 +20000 → +3000（15%）　每级血量 +100000 → +15000
+     · 妖魔血量底数 4200 → 300（开局顺畅）、每关增量 +18000 → +6000
+     · 妖魔攻击每关 +25 → +8（同步下调，避免战斗变长就必死）
+     · 升级成本斜率 +40 → +120（后期明显变贵）
+     实测（转生 100、攻速 8，仅靠灵界修炼）：1 小时推到 3604 关，击杀/秒稳定在 1.18 ——
+     推关明显吃力、升级收益越来越薄，正是预期的「撞墙感」。
+     加上其它系统后（魂契 + 丹药 + 香火全满）击杀/秒 45.3、1 小时 57601 关 ——
+     差距约 38×，玩家必须转去练符文 / 魂契 / 香火 / 丹药 / 纪事才能突破。
+     数值量级：第 1000 关妖魔血量 17.99M → 5.99M，第 1 关 4200 → 300。
+     必带的根因修复：LMG_ATTR 里硬编码了 add:20000，而 lmgAttrD() 读的是 a.add，
+     LMG_LIN.atkAdd 此前根本没被使用 —— 这正是上一轮「改了 LMG_LIN 数值却没变」的原因。
+     现已改为 LMG_ATTR 直接引用 LMG_LIN，杜绝两处再次不同步。
+   凡人卷1.35 灵界妖魔血量加强：每关 +6000 → +18000（3×）。
+     实测对比（2 小时连续推关、攻速 30/秒）：
+       +6000  → 每秒击杀 46.9，被攻速 30 封顶，攻击力溢出浪费 1.56×；2 小时 57521 关
+       +18000 → 每秒击杀 16.3，低于攻速上限，攻击力被充分利用；2 小时 28767 关（慢一半）
+     更重要的差别是瓶颈位置：+6000 时 atk 已能一击秒杀（比值 1.30），瓶颈在攻速，
+     再堆攻击力边际收益为 0；+18000 时比值约 0.45，需约 2 次攻击杀一只，瓶颈回到攻击力，
+     升级重新有实感，打击感也从「秒杀」变成「打两下」。
+     推关仍严格线性增长（关卡 ∝ 时间，斜率恒定），不会卡死。想再慢改 LMG_LIN.monHpAdd 即可。
+   凡人卷1.34 灵界数值全线性化：
+     原设计 atk/hp 为指数成长（100×1.2^lv、500×1.15^lv），怪物血量/攻击也是指数
+     （4200×1.285^层、42×1.235^层），升级成本更是 50×1.35^lv —— 指数叠指数，
+     数值膨胀到 1e33 以上（修炼 Lv.400 时 atk 已达 5.45e33），且「投入指数上升、收益相对变薄」。
+     现全部改为线性，参数集中在 LMG_LIN：
+       · 灵界攻击 100 + 20000×等级　灵界血量 500 + 100000×等级（保持原 5:1 比例）
+       · 妖魔血量 4200 + 6000×层数　妖魔攻击 42 + 25×层数
+       · 升级成本 50 + 40×等级（原为指数，与线性收益不同阶会导致后期卡死）
+     为什么线性体系自洽：击杀产出 ∝ 关卡（本就是线性）→ 累计灵力 ∝ t²，
+     成本线性 → 等级 ∝ t，于是 atk ∝ t、怪物 HP ∝ t，比值收敛到常数。
+     实测：模拟 2 小时连续推关，atk/怪HP 比值稳定在 1.30（+3000 时是 2.60，过于碾压），
+     推关可持续 —— 既不卡死也不爆炸，数值最终停在 1e8 量级而非 1e33。
+     老档处理：等级与关卡均不变，直接套新公式。实测五档进度（Lv50/200/500/1000/2000）
+     全部仍能推关，不会卡死。
+     必带的兼容性修复：atk/hp 类型由 exp 改为 lin 后，petPasSum() 与 runeSum() 里
+     按 type==='exp' 判定会失效 —— 已镶符文与灵兽被动的攻击加成会凭空归零，两处均已补上 lin。
+   凡人卷1.33 三处严重问题修复：
+     ① 灵魂被清零（严重·丢数据）：S.soul 是普通 Number（上限 SAFE_INT），但「离线收益结算」与
+        「洞府结算」两处却用了 dadd(_toD(...)) 把它写成大数对象（内部为 BigInt）。之后所有
+        「(S.soul||0)+n」都退化成非法运算，再经 capRes 的 !isFinite 判定被清成 0。
+        表现：面板看着正常、实际已坏，之后每杀一只怪都归零重来，玩家完全看不出来。
+        触发条件「启灵 + 在灵界 + 切后台 或 挂机满 5 分钟」几乎人人会踩。
+        修复：两处改回 capRes('soul', 普通数字加法)；新增 soulNum() 统一读取入口（无论存档里
+        被写成什么形态都收敛成有限数字）；load() 增加收敛 —— 已被污染的老档读档即自动修复。
+     ② 灵界「首次新纪录」香火从未发放：判定时机错了 —— 原代码先按未推进的 lmgLevel 判新纪录，
+        随后 lmgLevel+1 并立刻把 lmgMaxLv 顶到同一个值，导致下一次击杀 lmgLevel === lmgMaxLv，
+        「>」永远不成立。凡人界 _killOneFr() 顺序是对的（先 level++ 再比 stLv），灵界这里漏了。
+        修复：改为「先推进关卡 → 再判新纪录 → 最后更新历史最高关」；
+        关闭自动推关时同关重复刷不刷新纪录（只给微量），符合预期。
+     ③ 灵界下每帧白算凡人界伤害：render() 里 calcAtk / calcPsn / calcDps 无条件计算，
+        紧接着在灵界分支被灵界数值整行覆盖，等于每帧白跑三轮大数运算（数字越大越卡）。
+        修复：三行移入 else（凡人界）分支；灵界界面显示不受影响（仍走 lmgAttrD / lmgDps）。
+   凡人卷1.32 丹药一键服用：面板顶部加「一键服用全部」，每种卡片另加「一键 ×N」单种按钮。
+             不能简单 for 循环调 usePill —— 后者每枚都 renderPill + renderFarm + render + save，
+             背包几万枚时会卡死主线程（且刷爆日志）。改为先算清「每种能吃几枚」、一次性扣减，
+             最后只渲染一次、写一条汇总日志：1e12 枚实测耗时 17ms。
+             上限处理：spd / combo 有 PILL_CAP=100，超出部分留背包不吃，汇总会提示「N 种已满上限」；
+             满上限的卡片显示「已满」且不显示一键按钮。另加红点：有可服用丹药时点亮。
+   凡人卷1.31 仙途纪事（剧情）：给「数值跳变」补上叙事 —— 境界突破、飞升、渡劫这些节点
+             原本只弹一句提示，现在变成可收集的章节，凡人卷 31 章 + 灵界卷 26 章共 57 章。
+             凡人卷：残卷 → 练体二十境 → 破境 → 千关 → 百转 → 香火初燃 → 秘境 / 药圃 / BOSS；
+             灵界卷：天门 → 灵兽 / 法宝 / 心魔 / 魂殿 / 符文 / 洞府 / 分身 / 供奉 → 修真九境
+             → 渡劫九重（九段连续剧情，为当前版本的终点做一个体面的收尾）。
+             ① 条件全部复用现有进度字段判定，不新增统计变量 —— 故旧档进入即自动补签，
+                首次巡检用 silent=true，只写日志不弹窗（否则老玩家一进来被连弹几十个）。
+             ② 章节解锁只给「纪事称号」（纪念性、不带数值），数值收益集中在 5 个收集里程碑
+                （录 10/20/30/40/50 章 → 初识仙途 / 记事者 / 行路人 / 见证者 / 纪元执笔），
+                注册在 TITLES 末尾 —— 这样「想拿属性」与「被迫读剧情」解耦：不读也能玩。
+             ③ 面板分卷展示，未解锁章节显示「？？？」+ 达成条件，不剧透正文；
+                弹窗只弹一次且可关掉，剧情同时写入战斗日志，不打断挂机。
+             新增存档字段 lore；load() 只保留合法章节 key（防改档白送里程碑称号）。
+             两界功能系统各加「纪 事」入口（凡人界第 3 排改 cols6、灵界第 1 排改 cols7）。
+   凡人卷1.30 香火（两界联动）+ 多杀：
+             再调整（大幅提高难度）：三段增长率 1.035/1.050/1.070 → 1.055/1.075/1.100；
+                特殊属性（疾神 / 斩神）成本额外 ×10（INCENSE_SP_COST_MUL）—— 它们是整数型、
+                每级收益陡峭，与百分比类「升 1 级只加 0.5%」不同量级，不单独加价会被无脑拉满。
+                效果：战神到 Lv.100 约 1.2 分钟（保留前期反馈），Lv.200 约 20 小时，
+                Lv.300 约 3 年 —— 后期基本停滞，等后续新增香火获取途径。
+                另：MAX 按钮单次上限由固定 200 级放开为「该神位等级上限」。
+
+             调整：供奉成本由「全程 1.010^lv」改为三段递增（1.035 / 1.050 / 1.070，分界 Lv.100 / 400）。
+                原曲线太线性、一路平滑地快，几百级就满了；新曲线前段平缓（快速起量有反馈）、
+                后段越来越陡（Lv.400 后基本停滞，等后续新增获取途径）。
+
+             ① 香火：补上「灵界 → 凡人界」这条缺失的回路（FR_BOND 是反向且算完即静止，
+                灵界此前对凡人界零反馈，启灵后凡人界等于退休）。香火与 FR_BOND 互为镜像。
+                获取无上限、可重复刷：每次击杀给微量（随关卡提升），首次达到新纪录关额外更多
+                （同关重复刷只拿微量）；凡人界与灵界击杀都计入。
+             ② 神位 12 个：10 个百分比类上限 Lv.1000，2 个特殊属性（疾神·多杀上限 / 斩神·斩杀线）
+                因属整数型、收益陡峭，独立设较低上限（100 / 50），不参与 1000 级。
+                战/锐/速/伤/毒 接凡人界属性池，经/塔/箱/功/转 接对应产出系数。
+                香火只作用于凡人界，不参与任何灵界计算，不回流。
+             ③ 多杀：只有「本次攻击伤害溢出、打穿当前怪」才继续斩杀后续怪物；
+                下一只血量按 BASE_GROW(1.062)^关卡 递增，故能连斩几只完全由溢出量决定 ——
+                碾压越深连斩越多、卡关时自动退化为 1 只，天然收敛，不需额外门槛。
+                上限由香火「疾神」给出（基础 2，满级 102）。
+             新增存档字段 incense / incenseLv / incenseFirst；load() 收敛越界等级、清除非法 key、
+             余额为负归零，旧档缺字段自动补空。两界功能系统各加「香 火」入口。
+   凡人卷1.29 灵界符文（新系统）：定向属性镶嵌 + 同系套装，与「法宝」刻意做成两条互补路线 ——
+             法宝 = 随机掉落、主属性随机 ±20%、词条随机，靠洗练赌运气（不可规划）；
+             符文 = 13 种与灵界属性一一对应、加成固定，玩家自选镶嵌（可规划、可定向补短板）。
+             ① 槽位：8 个，按灵界历史最高关解锁（1/50/150/300/500/800/1200/1800 关）；
+                同一种符文只能镶 1 枚 —— 否则 8 槽全堆单项会让该属性失控。
+             ② 品阶：5 档（凡/灵/玄/神/仙），获取时按灵界关卡定上限（与法宝 artiMaxQ 同口径）。
+             ③ 等级：Lv.1~10，靠「吞噬」升级而非货币 —— 不挤占灵石 / 灵魂 / 灵力的既有出口；
+                狗粮按品阶折算点数（凡1/灵2/玄4/神8/仙16，等级每 +1 额外 +25%），
+                升级所需点数随等级递增（Lv.1→2 需 1 点 … Lv.9→10 需 9 点）。
+             ④ 套装：同系（战5 / 御4 / 源4）镶够 2/3/4(/5) 件 → 该系符文效果 ×1.15~1.55。
+                倍率只作用于「符文本身给出的属性」，且符文属性走既有加法池，
+                因此套装置独立乘区也不会与魂契 / 法宝 / 灵兽被动叠乘失控。
+             ⑤ 掉落：妖王（每 10 关必掉）+ 心魔试炼，复用现有入口，不新增产线。
+             新增存档字段 lmgRune；load() 收敛非法数据（种类/品阶/等级越界、悬空引用、
+             同种重复镶嵌、bag 非数组、seq 小于最大 id），旧档缺字段补空且不继承运行时残留。
+             灵界功能系统第 2 排由 7 格改 8 格（新增「符 文」），改用 cols4 铺满两行。
+   凡人卷1.28 幽冥魂殿：给「灵魂」补上消耗出口（此前后者只在修真突破一处能花，
+              主线/秘境/双塔/BOSS/离线/洞府/分身 七条产线却全在产，攒到天文数字无处可用）。
+              灵界功能系统新增「幽 冥」入口（第 2 排由 5 格改 6 格，设置仍自动落到末位），三板块：
+              ① 魂契：10 条永久属性成长（攻/血/防/速/暴击/暴伤/穿透/灵力/灵石/灵魂感悟），
+                 单条上限 Lv.40，成本 1.28^lv 指数、效果严格线性（每级固定增量，不做复利）；
+                 10 条全满约 2e8 灵魂，刻意压在修真（全破约 1e15）之下好几个数量级 ——
+                 魂契是「前期能点、中期能铺满」的线，修真仍是长线，两者争夺同一份灵魂形成取舍。
+                 加成并入灵界属性既有加法池（与修炼/转生/灵天赋/灵兽被动/主角等级/凡人修为/法宝同池），
+                 不设独立乘区；「悟魂篇」还形成正反馈：投入越多，产灵魂越快。
+              ② 魂市：换灵石 / 灵力 / 灵兽经验 / 主角经验 / 洗练石 / 心魔票。
+                 资源类产出随当前灵界关卡线性放大（第 N 关 = 基准 ×(1+N)）；
+                 洗练石与心魔票刻意不放大 —— 它们本身是稀有硬通货，随关卡放大等于通胀。
+              ③ 魂召：灵魂抽灵兽碎片（权重 55/30/12/3，明显优于灵石抽的 70/25/4.5/0.5，
+                 是高品质碎片的主要来源）、以及直接掉法宝成品（品阶按当前关卡判定，25% 概率高一档）。
+              全部收益仅作用于灵界，凡人界公式一行未动；新增存档字段 soulPact / soulBuy / soulDraw，
+              load() 收敛超限等级、清除非法 key，旧档缺字段自动补空。
+              另：删除常量 SEED_W（药园种子权重，声明后从未被读取，属死代码）。
+   凡人卷1.23 灵界离线收益：此前挂机只发凡尘宝箱，启灵后离线 8 小时灵力 / 灵石 / 灵魂 全是 0。
+              现补上灵界结算，与凡人界共用同一时间戳与时长上限（2 小时 / 聚宝乾坤盆 4 小时）。
+              口径：不推关 —— 只用当前关卡的产出公式，层数原地不动（手动选关刷法宝不会被挂机冲掉）；
+              产出 ×60%，产物为 灵力 / 灵石 / 灵魂 / 灵兽经验（进池）/ 主角经验（自动升级）。
+              击杀速率复用现成 lmgDps()（含暴击 / 连击 / 减伤 / 命中）并叠加出战灵兽输出 ——
+              朴素「攻击 vs 血量」估算会漏掉这些，把击杀数低估几十倍、离线收益形同没有。
+              不产洗练石（心魔 / 妖王是手动内容，保留其价值）。面板：属性修炼 → 离线收益卡片。
+   凡人卷1.22 妖王挑战 → 改名「心魔试炼」，与主线灵界妖王彻底分开：
+              心魔强度只看「自己成功过几次」（血量/攻击/等效层 按成功次数成长，无上限），
+              与主线层数完全无关 —— 主线层数可无限涨，跟着它走会让挑战难度与掉落双双失控。
+              进入时保存主线层数，战败 / 退出均恢复，心魔战不推进也不损失主线进度；
+              每胜 1 次下一只更强、掉落品阶更高（品阶门槛按成功次数 0/3/8/15/25）。
+   凡人卷1.22 灵界主线：战斗日志上方新增主控条 ——「自动推关」开关（关闭后击杀停在当前关，
+              可卡关刷妖王法宝 / 练级）+「选关」按钮（可跳到 1 ~ 历史最高关 任意关，
+              含上一关/下一关/上个妖王/下个妖王/最高关 快捷跳转）。
+              死亡退回上一关（最低第 1 关）保留不变。
+   凡人卷1.21 凡人修为（跨界反哺）：取凡人界 6 项「需持续投入」的养成度（经脉突破 / 药园阶段 /
+              秘境关卡 / 双塔层数 / BOSS 通关 / 主线关卡），按 √ 曲线收敛后加算进灵界，满额 +90%；
+              主属性吃全额，灵力 / 灵石 / 灵魂 收益吃半额；并入现有加法池，不设独立乘区。
+              面板：属性修炼 → 主角重修 →「凡人修为」卡片，逐项显示进度与加成。
+   凡人卷1.21 灵界法宝（6 部位 / 5 品阶 / 完整养成）：妖王必掉 1 件，层数决定品阶上限
+              （50 关灵品 / 150 玄品 / 400 神品 / 1000 仙品），档位衰减使高层不再掉凡品；
+              主属性 + 随机词条 + 强化 +15 + 洗练 + 分解；新增资源「洗练石」（妖王掉落 / 分解）。
+              部位与词条池刻意不含 攻速 / 暴击率 / 连击（三者有设计上限，不做随机放大）。
+   凡人卷1.21 妖王挑战：不限次数，直接跳到下一个妖王层（跳过中间小怪），层数越高掉落越好；
+              记录跳层前层数，打不过可「返回推关」退回，避免卡死在打不过的妖王层。
+   凡人卷1.20 凡尘宝箱稀有掉落：极小概率直接掉出 灵宠 / 功法 / 宝物，按售价分 6 档，
+              越珍贵概率越低（1/2万 ~ 1/1563万）；无保底，纯概率（保底会把最贵的一件「保送」出来，
+              直接抹平稀有度梯度）。重复掉落 → 该件重数 +1，每重效果 +50%，上限 10 重；
+              满重或「无属性可升」后不再进池。特殊属性（攻速 / 暴击率 / 连击）本身有上限，
+              不随重数提升 —— 只涨同一件里的其余项（如洞玄天眸只涨暴伤，暴击率恒定 40%）。
+              纯特殊属性（疾风步）与机制型（修罗战魂 / 自在轮回印）重复掉落不再出现。
+   凡人卷1.20 修复（真实 bug）：凡人界 petOn(k) 与灵界 petOn() 同名，函数声明提升使后者整包覆盖前者，
+              凡人界灵宠的 eff 加成（最终伤害 / 攻速 / 暴击 / 连击 / 内力 / 宝箱产出 等）从未生效。
+              灵界侧改名 lmgPetOn()，两套体系各自独立。
+   凡人界攻速化改造（仅凡人界，灵界不受影响）：
+   ① 宝物「千手法相」原「自动点击 +1 次/秒」→ 改为「攻击速度 +100%」
+      （自动点击系统已整体移除，该宝物位改由攻速承接）
+   ② 新增攻速专精宝物：流光遁影符 +400% / 太虚疾雷印 +1200%
+   ③ 宠物全面补攻速：赤炎灵狐 +25% / 紫雷貂 +20% / 青风隼 40%→70%
+      / 幽冥狼 +15% / 玄冥龟 +10% / 寻宝灵鼠 +20%（碧毒蟾王为纯毒系，不加）
+   ④ 手动点击上限：滚动 1 秒窗口内最多 8 次有效手动攻击，超出忽略并提示（防连点器）
+      灵界不节流（灵界节奏由灵界攻速独立决定）
+   ⑤ 攻速成就：新增「累计攻击次数」（13 项 × 10 阶段，ACH_MAX 120 → 130），
+      每阶段攻击速度 +12%；里程碑「鬼手神工」改攻速 +50%，新增 t:125「雷动九天」+120%
+      配套 hitInc() 在 doHit / doTowerHit / doBossHit / doSecretHit 四处计数（灵界不计入）
+   ⑥ 清理：S.autoClickBought / autoClickOn 死字段、TITLE_EFF.click / TITLE_SPECIAL.click
+      死映射、titleEffTxt 的 click 分支
+
+   启灵门槛    由测试期 0 恢复为 100 次转生（版本号保持「凡人卷1.0最终版」不变）
+   立绘回归修复  修正「进过一次灵界后主线怪物图永久不显示」——applyRealmUI 仅在进灵界时隐藏
+                .boss-img 却无人还原，改为由 syncEnemyVisual() 统一恢复（立绘显示唯一真相源）
+   凡人卷1.9  新宝物「修罗战魂」：暴击率突破 100% 后每满 100% 多一次暴击（二次/三次暴击，伤害连乘）
+              新宝物「破界神锋」：无视防御 +50%，破防突破 100% 后每多 1 点伤害 ×2（指数放大）
+              商店新增「宝物」分类；功法/宠物/宝物按「攻击 · 毒 · 辅助」分组显示（商店+三大面板）
+   凡人卷1.10 平衡：经脉突破对「连击率/毒层上限/暴击率/暴伤/破防」改为线性 +30%/次，
+              掐断「连击×毒层」「暴击率×暴伤」双重放大导致的超指数爆炸（原突破3次即超1000关血量 11 个数量级）
+   凡人卷1.11 多重暴击改加法：×[1+(暴伤-1)×(1+重数)]（原暴伤^(1+重数)，突破12次达1e47倍）
+              连击新增递增：第N段 ×(1+0.15N)，由纯线性变为超线性，与多重暴击收益对齐
+   凡人卷1.12 经脉突破全部属性改为线性 ×(1+系数×次数)（原 2^次数 指数翻倍），成长曲线彻底平滑
+   凡人卷1.27 修复：
+   P0-1 离线收益可刷：save() 只写 o._t 从不回写 S._t，而 checkOffline() 读 S._t —— 同一语义两条路径
+        各写各的。在线挂机两小时后切后台，S._t 仍是旧值 → 被算成「离线两小时」，且可反复结算。
+        现 S._t 为唯一真相源（save 每 5 秒推进，o._t 只是镜像）；sec<60 与产出 0 的分支也一并推进
+   P0-2 敌人区视觉：applySecretUI / applyTowerUI / applyBossUI 三者都操作 wolfImg，靠「最后调用者胜出」，
+        applyBossUI 收尾且无条件设 display → 退出 BOSS 会抹掉秘境/塔立绘，初始化顺序也不得调整。
+        抽 syncEnemyVisual() 独家控制图片，按 inBoss > inSecret > inTower 优先级，调用顺序不再有依赖
+   P1-1 删模块变量 bossW，统一 bossWorld()（= S.bossWorld || 'fj'）：原双重真相源要在 4 处同步，
+        漏一处就把通关进度写进错误界别数组（读档时 bossW 仍是默认 'fj'）
+   P1-2 critMult() 短路 if(cd<=1) return 1 会在暴伤恰好 ≤100% 时悄悄吃掉多重重数 → 去掉短路
+        （cd=1 时公式结果同为 1，critExtra() 内部有 treHas 前置判断，退化安全）
+   P2-1 S 初始定义补 _t / _warn
+   P2-2 破防显示只给封顶 100%，而 ignAmpMul() 用未封顶 ignRaw() 算超出部分 → 拆三段展示
+        「100%（原始 145%）+ 破界神锋放大 ×450　超出 45 点」，仅在拥有宝物且溢出时显示
+   P2-3 S.kills 转生归零，但 stAtkD/stCrtD/stPsnD 等成就统计不归零 → 口径不一致。
+        改为累计击杀（"击败"本就隐含累计语义）
+   P3   bossKill() 末尾补 renderBoss()（面板开着时通关次数/层数才实时更新）·
+        claimAllQuests 领取上限 500 → 1e4 并在触顶时说明「剩余可再点」
+   凡人卷1.26 修复 6 类问题（设置文案 / 负数提示 / 全部开启 / 转生币缓存 / 数组签名 / 杂项文案）：
+       #1  设置面板文案：说明仍写「影响自动攻击频率上限（900/500/250ms）」，而该帧率地板早已移除，
+           fps 实际只作用于秘境 tick（500/320/160ms）；按钮「省电 30 / 标准 60 / 极致 120」也易被
+           误读为全局帧率 → 说明改写真实作用域，按钮改为「省电 500ms / 标准 320ms / 极速 160ms」，
+           版本号占位硬编码「凡人卷2.0」清空（未打开设置时会闪出错误版本）
+       #2  farmUpgradeAll 负数提示：farmStage 异常（NaN）时 while 条件直接为假 → n=0 且 lastCost 仍为 0，
+           原式 0 - S.gem 弹出「还需 -5000」；高阶段 farmUpCost() 还可能算出 Infinity。
+           现仅在差额「为正且有限」时显示具体数字，否则提示「当前无法继续升级」
+       #3  「全部开启」只开 200：按钮写「全部开启」却硬编码 Math.min(S.box, 200)，几万宝箱要点到手酸。
+           改为一次性开完（单次上限 2e5 防主线程卡死），超出时提示剩余数量可再点
+       #4  rebirthGain() 每帧重算：render() 由攻击循环驱动（攻速数十次/秒），每次都跑大数
+           dadd/dmul/dStr。改为按「关卡 + 三个加成系数」记忆化，并缓存显示字符串；
+           实测同关重复调用 0.41μs/次（原约 1.4μs），按钮改用 rebirthGainStr()
+       #5  serVal 数组序列化：原把数组混进对象分支，用 Object.keys().sort() 做「字典序」排序
+           （元素 ≥11 时顺序变成 0,1,10,11,…,2），且 ["a"] 与 {0:"a"} 输出完全相同 ——
+           攻击者可把数组换成同键对象而不触发签名校验，运行时 indexOf() 报错（类型混淆）。
+           现数组独立走 [ ] 包裹 + 数值下标顺序。
+           配套：签名格式变更会让旧档对不上，故 load() 中若「回滚后摘要 == 回滚前摘要」
+           即判定为格式升级而非篡改，静默重签，不弹「存档异常」吓玩家
+       #6  杂项文案：药园进阶日志仍打印 Math.pow(2.5, 阶)（产量早在 1.3 改为加法，20 阶会显示
+           9000 万倍）→ 改 farmGemMul()；暴击/暴伤描述拼串怪异且未说明多重暴击出口；
+           攻速描述在自身初始化里回查 ATTRS.find → 抽 ATTR_SPD_MAX 常量
+   凡人卷1.25 修复 7 项：
+       P0-① 药园面板 1 秒后全毁：farmTick 对 .fm-plot[data-i] 直接赋 textContent，
+             既把 .fm-pn 编号 / .fm-ps 种子名一并抹成纯文本，又因 data-r 在子级 .fm-pt 上
+             而 parseInt(null)=NaN → 永远显示「可收获」；改为只更新 .fm-pt[data-r]
+       P0-② 数据统计「成就进度」写死 /100，而阶段总数为 ACHS.length×10=120 → 永远不圆满；
+             改为动态取 ACHS.length*10
+       P1-③ renderFarm() 不更新 _farmSig：种植 / 收获 / 选地等直接调用路径不刷新签名，
+             下次 tick 会误判结构已变而再整块重建；抽 farmSig() 并在 renderFarm 末尾同步
+       P1-④ save() 的 _bak 序列化三遍：JSON.stringify→parse 还原对象→整体 stringify 再走一遍；
+             对象 / 数组改为以 {__s:1,j} 字符串留存，回滚处对应识别（兼容旧档对象形态）
+       P2-⑤ _lastAps 用 !== 精确比较浮点攻速，尾差即重启定时器 → 改 1e-6 容差
+       P2-⑥ 自动点击提示仍写「需先在商店购买」，该道具已归入宝物「机关傀儡」→ 改文案
+       P3-⑦ 切后台不结算离线收益：_onVisChange 切回前台时补算（浏览器会节流后台定时器）；
+             顺带堵住「领完刷新 / 反复切后台可无限重领宝箱」—— 结算后推进 S._t 并落盘
+   凡人卷1.24 修复 11 项（按严重度分级）：
+       P0-① 天赋「开局削弱」残留扣血：1.22 已把该天赋改为「最终伤害+15%」，但 killBoss() 生成下一只怪时
+             仍残留 if(tHas('kjrx')) S.hp = S.hp*0.95 —— 买了该天赋每只新怪都白扣 5% 血，影响实战平衡
+       P0-② wipeSave 监听器移除失效：document 上的 visibilitychange 是匿名函数，
+             无法 removeEventListener，清档后切后台仍会被触发（仅靠 _wiped 兜底）；
+             现具名为 _onVisChange 并真正移除，同时停掉 acTimer / secretTimer
+       P1-④ 连击率描述仍写「上限 100%」，与实际「每满 100% = 1 次必连、无上限」不符 → 改文案
+       P1-⑥ 遗物突破费用超双精度安全整数：Math.round(5000×2.4^ad)，ad 上限 100 → 约 4e38，
+             远超 2^53，尾数丢失导致费用不精确、Math.round 对超整数无效；
+             改用大数幂运算 + payCost()/canPay()（超安全整数则判资源不可能够，避免扣费精度丢失）
+       P2-③ 商店扣费缺少回滚：种子分支在 isNaN / SEEDS 缺失时直接 return，宝石已扣却未发货
+       P2-⑤ 三处缩进：renderShop 中 gf_ 分支多缩进 4 格 · costFor 续行过度对齐 ·
+             bossW 声明与 bossBaseHp() 挤在同一行
+       P2-⑧ 死代码：feat() / todoSys() / farmRipeCount() 全文件（含 HTML onclick）无调用点
+       P2-⑨ 命名误导：_wolfBaseImg 实为「覆盖层自身初始图」，非底层主线怪图 → 改名 _wolfInitImg
+       P2-⑩ 重复模式：buyShop 三个委托分支重复「先扣后退」，改为先校验后扣费
+       P3-⑫ 时序脆弱：初始化 applySecretUI→applyTowerUI→applyBossUI 的顺序有覆盖依赖，加注释固化
+       P3-⑬ 监听器冗余：removeEventListener('beforeunload', save) 对应的监听从未注册 → 删除
+   凡人卷1.23 六项修复（重点是签名形同虚设）：
+       ★ 签名覆盖全部字段：原仅覆盖 26 个关键数值字段，talents / meridian / achClaim / gongfa /
+         pets / treasures / relics / boss_* 等大量进度字段被改都检测不到。
+         改为排除法（仅跳过 _sig），_bak 也由「26 个数值」升级为「除 _sig/_t/_bak/v 外的完整快照」，
+         改任何字段（含对象型进度）都能检测并回滚。
+       ① 删除属性面板尾部多余的 section 结束标签（原开 5 闭 6）
+       ② farmTick 的 ns.length 比较修正：data-r 仅生长中地块才有，与 farmOpen 几乎永不相等，
+          导致每秒整块重建 DOM、结构签名优化完全失效；改为统计 [data-i] 并与 FM_PLOT_MAX(10) 比较
+       ③ render() 属性列表渲染前移：原在秘境/塔/BOSS 分支之后，这三种模式下加点不刷新
+       ④ sbResetAvail / sbReset 改用 today()（原 toDateString() 随系统语言变化，与 expDay 等不一致）
+       ⑤ sanitize 的 put() 按 _bak 原类型同步：原一律写成 {m,e}，会把普通数字字段变成大数对象，
+          回滚后类型错乱
+   凡人卷1.22 六项修复：
+       ① 取消全部 BOSS 专属词条：创伤加深→最终伤害+10%、开局削弱（原 weak 无任何引用，完全无效）→最终伤害+15%、
+          伺机暴击→暴击率+6%、毒煞领域→中毒伤害+80%，并删除 bossdmg / psnboss / lowcrit 三处乘区与 lowHp 变量
+       ② 猛攻血脉（暴击后 3 次强化）→ 最终伤害 +10%，删除 blood / bloodStack 全部逻辑与存档字段
+       ③ 商店「自动点击（机关傀儡）」死分支移除（已归入宝物，SHOP_ITEMS 中无此项）
+       ④ 蚀骨丹面板公式修正：主面板原写 ×S.psnLv、统计面板误用 ×2，实际结算为 S.psnLv + 10×丹药数，统一为 psnPerStack()
+       ⑤ 存档每日次数防绕过：导出后立即 save() 落盘；导入时以本地计数覆盖被导入档，避免导入旧档把次数刷回 0
+       ⑥ BOSS通关成就封顶 10000 次不可达（面板长期卡 100/120），曲线下调为 800 次
+       注：斩杀线对主线/秘境/塔/BOSS 全部敌人生效，非 BOSS 专属，保留（描述已修正）
+   凡人卷1.21 伤害类型精简：取消「附加固定伤害」与「附加真伤」两类独立词条，统一并入最终伤害% / 攻击力%
+       锋刃余威 附加伤害+50      → 最终伤害 +20%
+       重刃冲击 附加伤害+100     → 攻击力 +30%
+       穿刺碎片 附加伤害+200     → 最终伤害 +45%
+       剧毒烙印 每层固定毒伤+15  → 中毒伤害 +150%
+       连击破锋 连击固定附加+30  → 连击率 +20%
+       鸿蒙·不灭金身 真伤500%    → 最终伤害 +300%
+       同步移除 doHit / doSecretHit / doTowerHit / doBossHit / calcHitExpect 中的
+       固定附加 / 真伤 / 连击固定附加 / 每层固定毒伤 全部引用（固定值后期必然失效）
+       注：无视防御的附加真伤属破防机制本体（破界神锋依赖），保留
+   凡人卷1.20 修复 13 项：
+      严重 ① 塔/秘境/BOSS 三套结算缺失大量主线乘区：不死不休叠层与伤害、破防附加真伤、
+             鸿蒙·不灭金身真伤、天赋固定附加、普攻加成天赋、对BOSS伤害与毒煞领域、连击破锋固定附加；
+             现已与主线完全对齐（这些天赋/功法/宠物原先在三模式中基本或完全失效）
+           ② 秘境重复结算：render() 中「攻速变化即重启定时器」会把主线 autoTimer 重新拉起，
+             与 secretTimer 叠加；现 startAuto / syncAutoClick 在秘境中直接拒绝启动
+           ③ 蚀骨丹毒伤只进面板不进实战 → 提取 psnPerStack()/calcPsnDmg()，四模式与面板共用
+           ④ 塔毒伤漏掉功法与宠物的毒伤加成 → 改用统一 psnMultSum()（并补入经脉 psn）
+           ⑤ 面板毒伤公式与实战不一致（混入 merSum 却漏掉 6 项）→ calcPsn 直接调用 calcPsnDmg()
+      中等 ⑥ 读档恢复 BOSS 血量前未同步 bossW → 重算血量会按默认界别，已把同步提前到恢复之前
+           ⑦ 经脉面板「当前效果」漏算经脉成就加成 → merCurEff 乘 achMerMul()
+           ⑧ 少量加点逐次累加 vs 大量闭式，取整规则不同导致花费微小差异 → 小批量也走闭式 maxAfford
+      轻微 ⑨ 图片缓存变量命名误导（名为「原图」实为覆盖层自身初始图）→ 改名并加注释
+           ⑩ 小数值显示取整丢精度（1.05→1）→ nStr 按量级分档保留 1~3 位小数
+           ⑪ 三模式连击循环重复计算攻击力 → 缓存 _atk（与主线一致）
+           ⑫ maxAfford 对 Infinity 无防御 → 加 isFinite 检查与上限
+           ⑬ 药园一键升满的失败提示二次计算成本 → 循环内记录 lastCost 复用
+   凡人卷1.19 修复 10 项：
+      严重 ① 秘境攻击被 2~3 路重复结算：autoTimer 调 doHit → 路由 doSecretHit（一路）、
+              secretTimer 直接 doSecretHit（二路）、自动点击 acTimer doHit(true)（三路），
+              导致秘境推进速度为设计值 2~3 倍；现进入秘境停 autoTimer/acTimer，退出恢复
+           ② 读档恢复 BOSS 战时 bossW 仍为默认 'fj'，与 S.bossWorld 脱节 → 战斗与奖励写错界别数组；
+              load 末尾与 applyBossUI 双重同步
+      中等 ③ 统计面板两行同名「凡尘宝箱产出」→ 拆为「任务宝箱产出」（仅任务奖励）与「开箱产出加成」
+           ④ 同 ②，load 中显式同步 bossW，避免再次踩坑
+           ⑤ render() 中 _atkD = calcAtk() 声明后未使用，每次渲染白跑一次大数运算 → 删除
+      轻微 ⑥ 死代码：load 白名单中的 qc / plots2、每次 tick 查找不存在的 #farmWarn、未被调用的 offlineBoxPS
+           ⑦ save() 写 _bak 用字符串而 sanitize() 修正用数字 → 统一为字符串序列化
+           ⑧ renderFarm 每帧整块重建 → 改为结构签名比对，仅变化时重建，否则只更新倒计时
+           ⑨ 澄清毒层存档策略：塔/BOSS 保留的是「当前层」叠毒进度，换层仍由 kill* 清零
+           ⑩ calcHitExpect 连击段 O(N) 循环 → 闭式求和 N + grow·N(N+1)/2（N 上百时不再拖慢面板）
+   凡人卷1.18 修复 12 项：
+      数据丢失 ① doRebirth 转生后未 save（5s 内关页面转生白给）→ 补 save
+                ② buy 加点/降级、resetAttrs 一键重置 同样只 render 不 save → 补（与 resetOne 对齐）
+      防篡改误判 ③ sanitize 封顶后未同步 _bak → 签名不符 → 合法存档被判篡改并回滚；现修正时同步快照
+                ④ 大数转 Number 用 Math.pow(10, e)，e 超大时得 Infinity → 误判非法归零；改按 e>300 / e<-300 分段处理
+      状态残留 ⑤ inSecret 读档强制退出而 inTower/inBoss 恢复 → 加注释说明为有意设计，并清残留毒层
+                ⑥ S.poison 存档但读档不重置 → 主线带着上会话百层毒造成意外毒伤；非塔/BOSS 模式读档归零
+                ⑦ poison/ndxStack 清理从 doRebirth 移入 resetToMain，避免复用时遗漏
+      逻辑瑕疵 ⑧ upMerAll 的 if(n>5000) break 只跳出内层 while，上限形同虚设 → 外层同步判断 + while 条件约束
+                ⑨ enterBoss 经 exitSecret 间接重复 clearBossMode（有兜底无害）→ 加注释说明
+                ⑩ attack 中 popDmg 后紧跟 render，每次点击叠加两套开销 → 改用 renderNow() 节流
+                ⑪ critMult 无条件算多重重数 → 暴伤 ≤100% 时短路
+                ⑫ stLv 语义混淆（统计 vs 转生币计算）→ 面板标签改「历史最高关」并加注释说明按 S.level 计
+      另：标注 gem/neili 的 Number 精度上限、_bak 结构变更会导致旧档判为篡改的注意事项
+   凡人卷1.17 修复 12 项（功能 7 + 死代码 5）：
+      功能 ① achHit 嵌在毒伤分支内 → 无毒性时攻击/暴击总伤害成就（20个）永不累计；4 个战斗模式全部移出分支
+            ② 塔/BOSS 返回对象缺 critN/comboN → 多重暴击「暴击×2」「连击×3」飘字不显示；塔另补连击递增 ×(1+0.15N)
+            ③ 经脉突破面板与日志仍按 2^次数 显示（实际线性 ×(1+1.0×次数)），面板见 ×1024 实际仅 ×11 → 统一线性
+            ④ 破界神锋注释/描述写「指数 ×2」，实现为线性 ×10/点 → 注释与文案修正，避免误导平衡判断
+            ⑤ 天赋「斩杀线」仅主线判定、「猛攻血脉」仅主线消耗 → 秘境/塔/BOSS 三模式全部补齐
+            ⑥ atkSub 显示「N 层上限」语义错位 → 改「N 毒层上限」
+            ⑦ 攻速描述「上限 2.0」早已废弃（max=100 且不封顶）→ 改为显示实际等级上限
+      死代码 ⑧ killBoss 首行 inSecret 分支永不执行（doHit 已分流）⑨ enterTower 中 if(S.inBoss) 被 clearBossMode 覆盖
+            ⑩ S.qc 只写不读（questRollDay/claimQuest 维护，无读取点）⑪ S.clickBonus 无任何计算引用
+            ⑫ attack() 中 getBoundingClientRect 结果未使用
+   凡人卷1.16 修复：① wolfImg 是 absolute 覆盖层，applyBossUI 无条件 display='' 导致主线怪物被狼图盖住
+              （初始化 secret→tower→boss，末步还原可见）→ 改为仅 BOSS 时 block，否则 none 露出底层主线怪图
+              ② save() 对象字面量 farmLv 键重复（拼接残留，易掩盖遗漏字段）→ 删除
+              ③ switchBossWorld 只改模块变量 bossW 未同步 S.bossWorld，bossKill 却写 S.bossWorld
+              → 双数据源错位（通关进度写入旧世界）· 现切页签即同步并存档，bossKill/renderBossMode 统一以 bossW 为准
+   凡人卷1.15 代码审查修复 10 项：
+              ① 修复破损 div（练体弹窗外层 div 开标签内误嵌注释导致未闭合）→ 练体及其后所有弹窗被错误包裹
+              ② PETS 末项「寻宝灵鼠」tag 误写进 eff 对象内部
+              ③ merCurEff 用 2^broke（指数）而 merSum 用线性 → 面板显示 ≠ 实际生效，统一为线性
+              ④ openBox 宝箱产出重复计算（逐次 ×(1+成就) 后又整体 ×boxMul），统一为 boxMul()
+              ⑤ bossCurMaxHp / bossUnlocked 用 S.bossWorld 而非当前显示的 bossW（切界后显示错误）· bossW 声明提前
+              ⑥ 秘境 / 塔 / BOSS 击杀未清 S.ndxStack（主线已清），三者补齐
+              ⑦ relicAdvance 复制粘贴残留（S.qt 注释串入代码、S.relicLv 重复声明）
+              ⑧ S 初始定义补 qt / petsOff / gongfaOff（原缺失 → load 的 hasOwnProperty 跳过 → 刷新丢失）
+              ⑨ 设置「帧率模式」与实现不符（实际仅作用于秘境 tick），改名「秘境节奏」并修正文案
+              ⑩ save() 去除 9 个重复字段（relicFrag/relics/farmStage/farmOpen/plots/seeds/pills/pillUse/relicAd）
+   凡人卷1.13 便捷：药园「一键升满」· 经脉「一键满级（全部）/ 一键突破（全部）」
+              平衡：破防获取量下调（加点 1→0.4%/级、丹药 2→0.5%/颗、经脉 per 1.2→0.3、破界神锋 +50→+30），
+                    不再一家独大；毒系宝物涨价（蚀骨毒囊 15→60 万、蚀心毒珠 25→120 万）
+   凡人卷1.14 修复：面板「总伤害」漏算暴击/破防真伤/毒层打击/终伤/破防放大/不死不休（面板值仅为真实约 1/40），
+              改为完整乘区解析式 · 修复清空存档后 800ms 内被自动写回导致删档无效
+              多重暴击 / 多重连击飘字显示「暴击×2」「连击×3」（二重及以上带倍数）· 塔/BOSS/秘境算法与主线统一
+   凡人卷1.8  弹窗滚动优化：标题吸顶 / 页签吸顶 / 关闭按钮吸底（sticky），滚动时始终可点
+              flex 弹窗头部本已固定，此处为统一兜底；装饰角层级提高避免被标题遮挡
+   凡人卷1.7  毒层功法拆为 7 本几何曲线（每层 ×100 递增，价格 ×5，无关卡限制纯宝石门槛）
+   凡人卷1.6  连击无上限：连击率取消 100% 封顶，每满 100% = 1 次必连（零头转为额外一段概率）
+              「连击秘卷」+1次 → 连击率+100%；成就「万法归一」同理
+              新功法「万毒噬心诀」「毒动乾坤」：每次攻击附带 毒层数 × N 伤害（受毒伤加成）
+              新资源「灵魂」：每击杀 1 只怪 +1（主线/秘境/塔/BOSS），资源栏显示
+   凡人卷1.5  【修复】BOSS通关层数不存档（S定义缺 boss_* 9字段，刷新即清零）
+              移除主界面预留货币位与金色等级徽章
+              自动转生改智能：推到极限（击杀需8下以上）才转，不再一达门槛就转
+              属性面板合并为「总属性」：删除灵属性，显示 总DPS / 攻击·毒（双色）
+   凡人卷1.5  ① 修复「灵界怪物打人不掉血」：切界/读档后统一由 syncLmgTimers() 幂等补启妖魔反击
+              计时器（旧实现只在 enterLing 里启动，刷新页面后永不反击）；
+              反击伤害新增「玩家最大血量 ×2%」下限，堆血后也能看到明显掉血
+              ②「灵修」更名为「属性修炼」，灵天赋 / 修真 两块并入同一弹窗，顶部分区切换
+              ③ 灵界怪物削弱：血量成长 1.32→1.285、攻击 50×1.28^n→42×1.235^n、
+                 妖王 ×5/×3→×4/×2.4、怪物减伤封顶 60%→45%、命中/闪避/穿透成长下调
+              ④ 灵兽被动随「等级 + 转生」加强（每级 +2%、每转 +60%，原转生仅 +20%）
+              ⑤ 特殊属性设上限：攻速 50 次/秒、暴击率 100%、连击 100 段（凡人界 / 灵界同口径）
+              ⑥ 凡人界新增内容：功法 4 本（惊雷遁法 / 风息真意 / 连环剑诀 / 破煞真言）、
+                 宠物 3 只（青翎风隼 / 踏雷龙马 / 焚天朱雀）、宝物 4 件（九霄风雷翼 / 刹那永恒钟 /
+                 千机连环谱 / 洞玄天眸）、天赋 2 条（风驰电掣 / 流金风煞），其中多条为攻速向
+              ⑦ 凡尘宝箱：掉落率 主线 15%→22% / 双塔 18%→26% / 秘境 10%→18%；
+                 开箱宝石 47%(2~8) → 60%(6~18)，遗物碎片 35%(1~2) → 26%(2~3)
+   凡人卷1.4  足三阳经 per 5→2 · 离线收益改为固定值（30箱/时 ×(1+转生/20)）
+              新增宝物「聚宝琉璃盏」、宠物「寻宝灵鼠」（凡尘宝箱产出 +100%）
+   凡人卷1.3  药园产量改加法（去指数爆炸）· 宝石产出收敛为「药园 + 凡尘宝箱」两处
+              宝石加成 → 凡尘宝箱产出加成（成就/宠物/经脉）· 宝箱掉率小幅削弱 · 离线收益削弱至 35%/2小时
+   凡人卷1.2  宝物系统（12 件稀世奇珍）+ 离线收益（凡尘宝箱·在线70%·4/8小时）+ 自动转生
+              存档每日下载/上传各 3 次；移除开发者模式
+   凡人卷1.2  宝物系统（12 件稀世奇珍）+ 离线收益（凡尘宝箱·在线70%·4/8小时）+ 自动转生
+              存档每日下载 / 上传各 3 次；移除开发者模式
+   凡人卷1.1  轻量防篡改：存档签名 + 数值合理性校验（防随手改数字，不影响存档分享）
+   凡人卷1.0  修复成就 / 功法 / 宠物刷新后丢失（load 的 hasOwnProperty 跳过动态字段）
+   v1.0  原始版本
+   v1.1  修复塔进度存档 / 兵器Lv0描述 / 秘境毒层注释 / 每日任务奖励数字
+   v1.2  属性基础价（攻速·连击·终伤=10，其余=1）+ 每级成本显示 + 科学计数法切换
+   v1.3  钱包区吸顶 + 删除转生币说明行 + 飘字数量封顶(12) + 转生按钮光晕改 opacity
+   v1.4  主线血量成长 1.16 → 1.14（仅此一项，其余不变）
+   v1.5  新增经脉（12 主脉 × 3 穴位）+ 第四排导航（宠物/功法/BOSS挑战 预留）
+   v1.6  数值上调：经脉每级小幅加强 / 经脉消耗大幅提高 / 练体属性大幅加强 / 练体内力消耗大幅提高
+   v1.7  新增 BOSS 挑战：五界（凡界开放，余四界预留）· 凡界 8 BOSS 各掉一种永久奖励 · 无限挑战血量×2
+   v1.8  BOSS 血量档位 ×30 → ×6（第1关不变，后续大幅削弱，第8关削弱约 7.8 万倍）
+   v1.9  BOSS 血量档位再削 ×6 → ×3（第8关累计削弱 1000 万倍，约 136 击可通）
+   v2.0  移除自动攻击帧率地板（攻速不再被 1~4 次/秒限制）+ 境界攻速大幅削弱（+760% → +149%）
+   v2.1  转生币 1000 → 10000（10倍）+ 新成就（经脉/BOSS挑战）+ 成就改手动领取（可一键）+ 奖励全面加强
+   v2.2  转生币改为与主线最高关卡相关：500 × 1.35^(最高关)（原 10000×2^转生数）；转生门槛保持 10 关/次
+   v2.3  转生币削弱：500×1.35^L → 50×1.31^L（L=200 时缩小 4100 倍），1.31 为不死锁下限
+   v2.4  转生币改「固定二次曲线」：10000 + 777.667×最高关卡²（锚点：L=300 → 7.00e+7）
+   v2.5  怪物血量成长 1.14 → 1.062（第1000关血量 ≈ 1.38e+29，达成 1e29 量级目标）
+   v2.6  转生币二次曲线去掉 300 关锚点，系数 777.667 → 100（前期不再夸张，后期仍小）
+   v2.7  移除界面右下角 v1.1 浮层 + 凡界新增第3个BOSS「轮回尊者」掉落转生币 +50%/次（百分比加成）
+   v2.8  新增功法系统：6 本功法（商店宝石购买→自动启用→功法导航查看/停用）+ 设置面板恢复版本号显示
+   v2.9  新增宠物系统：6 只灵宠（商店「宠物」分类购买→自动出战→宠物导航休息/出战）+ 商店分类（道具/功法/宠物/种子）+ 功法价格大幅提高
+   v3.0  转生币削弱（系数 100→30）· 秘境模式栏改 nowrap 杜绝换行跳动 · 首领标识移至血条上方 · 秘境首领专属立绘
+   v3.1  修复「挑战 BOSS 后仍停在主线」：render() 补 inBoss 分支（血条正确显示 BOSS 血量）+ 凡界 9 个 BOSS 各配专属立绘
+   称号系统（50 个 / 5 档品质）：
+       · 入口：功能系统第 4 排「称 号」（原预留空位），顶栏同步显示当前最高阶称号
+       · 覆盖主线 / 转生 / BOSS / 秘境 / 双塔 / 药园 / 经脉 / 丹药 / 功法 / 宠物 / 宝物 / 遗物 / 开箱 / 灵魂
+       · 品质：凡品 12 · 灵品 12 · 玄品 12 · 神品 8 · 仙品 6，神品起带「拥有 N 个称号」解锁门槛
+       · 达成即自动获得（3 秒巡检，启动时静默补发），获得后永久被动生效，无需佩戴
+       · 加成经 titleSum() 汇总后并入现有乘区（攻击/攻速/暴击/暴伤/连击/破防/终伤/毒伤/毒层/
+         药园产量/宝箱产出/转生币/内力/灵魂/自动点击），全部走已有公式，未新增结算路径
+   1.84  灵界资源修炼「每秒自己涨」修复 —— 真因是资源组（灵力/灵石/灵魂）吃凡人界反哺，
+         而挂机推主线会让主线关卡数持续上涨，玩家什么都没做倍率也在动。
+         改为资源组不再吃凡界反哺（实测主线 1 → 500 万关，倍率纹丝不动）；
+         战斗属性（攻击/血量等）仍吃反哺，那是跨界反哺本来的设计，未动。
+   1.84  法宝强化上限 +15 → +1000、符文等级上限 10 → +1000。
+         原成本为 1.35^lv 的纯指数，直接放开到 1000 会算出天文数字撑爆显示，
+         故改分段成本曲线：前 15 级维持原手感，之后逐级放缓（+1000 约 2.7 兆，正常显示）。
+   1.84  凡人界补「神品」档 + 品质分页：灵宠 / 功法 / 宝物 / 遗物 原本没有品质概念、几十条平铺。
+         现按售价自动定档（凡/灵/玄/神/仙），各面板新增第二行品质页签，点「神品」只看神品。
+         种类补齐：灵宠 14 → 19 只、宝物 44 → 48 件、遗物 13 → 15 件
+         （新增「蚀天遗物」接叠毒、「轮回遗物」接转生点），高端档位不再空置。
+   1.84  「诸天器录」改名「神兵」（按钮 / 弹窗 / 面板文案全改），兵器新增第四档「神品」
+         （原仅 凡铁/利器/绝世 三档），新增 太虚斩魂刃 / 九幽蚀魂幡 / 流光太虚翼 /
+         洞虚天诛戟 / 万劫毒渊 五件，分别接入 最终伤害 / 毒伤 / 攻速 / 暴伤 / 毒层上限。
+   1.84  修复真 bug：新增的宠物品质分页函数与灵界宠物面板函数重名被覆盖，
+         点「仙品」页签无反应。改名后实测：仙品 1 只、凡品 8 只、全部 19 只，切页正常。
+
+   1.85  职业技能强度顺序反转：原「一转第一个最强、五转第五个最弱」，与「每转解锁一个、
+         转数越高越强」的直觉相反。现数值整体倒序（总额不变），冷却同步递增 ——
+         一转是冷却最短的小招，五转是冷却最长的大招。三职业最强招（万剑归宗 /
+         万符朝元 / 不动明王）移至五转位。
+   1.85  修复连带问题：clsSkDmgScale 原取「前 3 个技能的 rate 和」作基准，倒序后前 3 个
+         变成最弱的 3 个，基准缩水约 23%、技能整体被误伤。改为每职业固定锚点
+         CLS_SK_BASE_RATE，总占比 = 锚点 × clsSkTotalMul(t)，与技能数值解耦。
+   1.85  高品质溢价：功法 / 灵宠 / 宝物此前神品、仙品与凡品同量级定价，过于便宜。
+         新增 FR_Q_MARKUP（凡 1 / 灵 2.5 / 玄 8 / 神 30 / 仙 120）。
+         ★ 品质由「原始售价分位」决定，溢价只作用于成交价，不会反过来影响品质定档
+           （否则会「涨价 → 排名变化 → 品质变化 → 又涨价」循环）。
+         实测：混沌太极图 25 亿 → 3000 亿；万毒归宗 60 亿 → 7200 亿；鸿蒙无极兽 15 亿 → 1800 亿。
+   1.85  统一面板价与成交价：功法 / 灵宠 / 宝物三个独立面板此前显示原始 cost，
+         而购买按溢价价扣款 —— 会出现「显示 15 亿、点了扣 1800 亿」。现三处面板
+         （含「宝石不足」提示与按钮禁用判定）全部改用溢价价；功法精研费基数同步改
+         用溢价价（此前仙品买 720 亿、精研只要几十亿）。
+   1.85  遗物 / 神兵高品质消耗再提高：合成碎片 [10,40,160,640,2560] → [10,50,400,6000,150000]；
+         升级突破系数 [1,3,9,27,81] → [1,4,20,150,1500]；神兵消耗 ×3.2/14/40 → ×4/30/300。
+   1.86  界面与性能专项修复（10 项）：
+         ① 按钮样式错乱：33 个 <button> 未指定任何 class，浏览器直接渲染系统原生白底按钮，
+            与古风暗金风格割裂。新增元素级 button 兜底样式（优先级低于 class，不影响既有按钮）；
+            并补全引用了却从未定义的 .set-fps / .ap-btn.ten / .ap-btn.inc / .fs-btn.b-gray /
+            .wp-list / .lmg-tip / .pr-modal / .pts-inline 等样式名。
+         ② 数字输入框：全局隐藏原生上下箭头（此前仅 .arb-sec-wrap 内的做了处理），
+            并给 input/textarea 加文字与背景兜底，防特殊 WebView 下配色失效看不清。
+         ③ 弹窗吸顶栏穿透：原标题渐变末段为 rgba(...,.95) 半透明，安卓 WebView 快速滚动时
+            内容会从半透明区透出盖住标题。改为完全不透明 + translateZ(0)/will-change
+            提升为独立合成层（实测 z-index 11、transform 已生效、背景不透明）。
+         ④ 小屏弹窗被裁切：max-height:700px 的媒体查询此前只压缩主界面、完全没管弹窗。
+            现补弹窗收紧 + 关闭按钮吸底并预留 env(safe-area-inset-bottom)。
+            实测 360×640：关闭按钮 bottom 619 < 视口 640，命中测试为按钮自身，可正常点击。
+         ⑤ 灵界立绘裁切：立绘原为 cover + center top，横屏 / 系统大字体时只露下半身。
+            改为 contain + center，任意容器比例下人物都完整可见。
+         ⑥ SVG 图标空白：新增 auditIcons() 巡检 + 防抖 MutationObserver。
+            symbol 不存在时不再空白，替换为文字占位（取 svg 的 data-fb，如法宝/符文/成就/
+            里程碑/称号各带首字）。实测注入失效 id 后正确渲染占位。
+         ⑦ 战斗飘字不再复用：原每次飘字都 createElement + 950ms 后 remove，挂机一晚产生
+            上万次创建销毁。改为对象池（上限 24）复用。实测连打 300 次飘字，DOM 仅 13 个；
+            回收后池内 24 个待复用，总节点数不再增长。
+         ⑧ 战斗日志累积：条数上限显式化为 LOG_MAX = 24，并改为一次性批量清理
+            （原 while 逐条 remove，节点多时反复触发重排）。
+         ⑨ 弹窗误触关闭：新增 dragMoved() 手势判定（位移 > 12px 视为滑动），
+            41 处遮罩关闭全部加上该判定 —— 滚动时手指滑到边缘不再误关弹窗。
+         ⑩ 存档输入框：无长度限制，粘贴超长文本会让 atob / JSON.parse 长时间阻塞主线程。
+            现 maxlength = 200000，并在 importSave 内二次校验。
+   1.87  代码质量与可维护性专项：
+         ① 性能三项复核：飘字对象池（上限 24）、战斗日志 LOG_MAX = 24 批量清理、
+            存档导入 maxlength = 200000 + 二次校验 —— 三项在 1.86 已落地，本轮复核确认全部在位。
+         ② CSS 根变量统一魔法值：新增 :root 变量 70 个（51 个高频 hex + 19 个常用 rgba），
+            替换 561 处魔法值。采用一对一映射、变量值与原值完全相同；
+            验证方式：把 var() 全部还原回原值后与原始 CSS 逐字符比对，结果完全一致 —— 外观零改动。
+            替换正则带 ID 选择器防护（前置必须是 : , ( 或空白，后置排除 { > : . [ ），
+            未误伤 #id 选择器；实测浏览器解析出 70 个变量、无未定义引用。
+         ③ 按钮 class 规范：新增通用 class .btn-gold（样式与元素级兜底一致），
+            并给 4 个仅靠内联 style 的裸 button（exitSecret / resetSecret / exitTower / maiFightExit）
+            补上 class。已复核其余裸 button 均由父级后代选择器正常渲染
+            （.m-close / .set-btns / .tw-pager / .tw-head / .confirm-btns / .pv-btns /
+             .sc-actions / .mine-bar-in），并非依赖全局兜底。
+            规范：后续新增 UI 一律给 <button> 写 class，元素级兜底仅作最后防线。
+   1.97  矿脉保底语义修正 + 凡人界反哺基准线统一：
+         ① 矿脉保底：1.96 误做成「每批保证 10 处高品质」，实为「连续 10 次刷新都没出
+            才补偿 1 处」—— 中途出了任意一处即重新计数，高品质仍以权重为主。
+            新增 MAI_MINE_HI_MISS = 10 取代 MAI_MINE_HI_MIN，计数存 S.mai.hiMiss（按界独立）。
+            矿点数 MAI_MINE_N 12 → 6：12 是当初为容纳 10 处保底才扩的，保底改语义后
+            不再需要席位，产出回到 1.96「削弱 40%」的真实口径（否则矿点翻倍会抵消削弱）。
+         ② 凡人界反哺六项 cap 由零散值统一到 500 / 750 / 1000 三档：
+            主线关 1440→1000、秘境关 540→500、双塔层 360→750、经脉突破 360→500、
+            BOSS 通关 270→500；药园阶段保持 18（荒田上限 FARM_STAGE_MAX = 100 阶，
+            套用 500 会永远拿不满）。曲线 pow(ratio, FR_BOND_P) 与「永不满额」结构未改。
+   1.98  凡人界反哺后期关卡门槛整体翻倍（1000 / 1500 / 2000 三档）：
+         cap 是「基准线」，提高 cap = 同一关卡数下 ratio 变小 = 反哺变少（削弱方向）。
+         原主线 1000 关对放置玩法过浅，玩家很快推到数万关，ratio 偏大导致后期反哺膨胀。
+         主线关 1000→2000、双塔层 750→1500、秘境关 500→1000、
+         BOSS 通关 500→1000、经脉突破 500→1000；药园仍保持 18。
+         实测反哺降到 0.65~0.72 倍（深度档降幅最大），资源组（封顶口径）前中期同降、
+         深度档不变（早已封顶）。曲线 FR_BOND_P 与「永不满额」结构仍未改。
+   2.01  职业技能扩充：每转解锁 2 个主动技能（一转 2 / 二转 4 / 三转 6，技能池 6 个）。
+         ① 三职业各新增第 6 个终极技能（太虚剑域 / 万符灭世 / 不灭金身），
+            冷却最长、单发最高，保持「越后解锁越强」；说明字典 18 条全覆盖。
+         ② 解锁判定 clsSkOpen 改按 clsSkTierOf（每转 CLS_SK_PER_TIER 个），
+            伤害缩放 / 自动释放 / 主界面技能行同步改用 clsSkOpenCount。
+         ③ 修 bug：升级提示 CLS_TIER_REB[i] 在第 6 技能处越界（i=5 无对应转数）。
+         ④ 存档：clsLv / clsActCd / clsActT 由 5 位扩到 6 位，旧档末尾补 0（投入不丢），
+            clsSkVer 2→3；新档直接跳过迁移，避免已投入等级被误清零。
+         ⑤ 顺手修正历史错字：双符决→双符诀、磳石冲→磐石冲（说明条目随之对齐）。
+   2.16  ① 法宝强化：其余属性直接逐条列在属性后面（与主属性同款行），去掉底部说明行。
+         ② 灵魂产出 ×0.3（SOUL_GAIN_RATE）；灵界灵石击杀产出 ×5（STONE_GAIN_RATE）。
+         ③ 顶栏图标固定 3 个（凡：宝石/灵魂/内力；灵：灵力/灵石/灵魂）；
+            资源统计拆成两排，顶栏已显示的资源不再重复出现在统计里。
+         ④ 药园丹药产出 ×0.06（PILL_OUT_RATE）。
+         ⑤ 符文高品质带副词条（RUNE_SUB_N），条数随品阶递增。
+         ⑥ 魂召灵兽：4000/40000 → 30000/300000 灵魂。
+         ⑦ 法宝 / 符文品阶由 5 档扩为 7 档（新增 圣品 / 道品），合成碎片需求同步提高。
+         ⑧ 心魔掉落改为全品阶随机（不再按成功次数封顶）。
+         ⑨ 新增称号 10 枚（灵界修炼 / 香火 / 遗物 / 秘境层数 / 灵天赋）。
+   2.15  ① 每日任务「寻箱探秘」奖励下调：凡尘宝箱 100 → 40。
+         ② 时间兑换【秘境产出】高估修复：原实现只算当前层击杀速率再整段外推，
+            忽略怪物血量按 120×1.26^(层-1) 指数增长，实测高估 30~500 倍
+            （lv100：外推 9720 只 → 真实 45 只 / 开自动重置 679 只）。
+            改为逐层推进模拟 secSimHour()：累计耗时直到用满时长，开启「秘境自动重置」
+            时按设定秒数模拟卡层重置；新增 SEC_EX_RATE 效率系数（默认 1）。
+         ③ 分身秘境产出预估 frCloneSecretGainPH() 同改逐层模拟，并按真实节奏
+            （每秒一 tick、每 tick 最多 1 只 × FR_CLONE_RATE）计算；显示改用 dStr。
+         ④ 时间兑换不再累加 stSecK —— 该字段驱动秘境系列称号与纪事，
+            模拟击杀不该白送称号 / 纪事（面板计数 secretKills 仍累计）。
+         ⑤ 分身秘境实际宝箱率仍写死 0.18，与 SEC_BOX_BASE（0.045）不一致，改为引用常量。
+   2.12  ① 每日任务：需求量回调到可完成区间（轮回 / 种药 100 → 10），奖励大幅提高
+            （宝箱 8/12/15/10 → 80/120/150/100）。原「提高需求」方向反了 —— 玩家本来就完不成。
+         ② 洞府凡人产线（宝物 / 宠物 / 功法掷骰）移除，改为三条资源产线：内力 / 宝石 / 转生点
+            （base 600 / 400 / 12 每时）。内力、转生点走大数写入，宝石走 capRes。
+         ③ 法宝强化对「所有属性」生效：非本槽主属性、又非词条的其余属性，
+            按主属性基准 × ARTI_ENH_ALL(0.35) × 强化等级 折算（原只有主属性涨）。
+         ④ 符文套装改为「3 / 6 / 9 件」三档（原 2/3/4/5 件），且倍率按品质加权 ——
+            RUNE_SET_QM [1,1.15,1.35,1.6,2.0] 取该系镶嵌符文的平均品质系数，
+            ×(1 + 档位加成 0.20/0.55/1.10 × 品质系数)；面板显示每档实算倍率与品质系数。
+         ⑤ 破界神锋重新降价：cost 100 亿 → 5000 万（破防放大斜率改 0.1 后效果削弱，原定价过高）。
+         ⑥ 仙途纪事补齐 12 章（fr32~fr43：万关 / 千转 / 万箱 / 秘境千层 / 药圃千耕 / 百战 /
+            百万斩 / 五千转 / 两万关 / 十万箱 / 亿杀 / 凡尘尽头），总数 76 → 88 章；
+            数组改为按「凡人卷 → 灵界卷」分组、各卷内按章号排序（新增插错位置也能自动归位）。
+         ⑦ 凡人界总入口导航按使用频率重排：背包 / 任务 / 商店 / 宠物 / 功法 / 宝物 / 成就 / 练体
+            在前，无限塔 / 遗物 / 秘境 / 经脉 / 神兵录 / BOSS 居中，
+            不常用的天赋 / 丹药 / 药园 / 称号 排最后一排。
+         ⑧ 统一改名：「奇经八脉」→「经脉」、「修炼秘境」→「秘境」（21 + 17 处，含面板与提示文案）。
+   2.11  ① 灵界兑换汇率收紧 10 倍：LMG_EX_RATE 100000 → 1000000（宝石→灵石、内力→灵力同口径）。
+         ② 时间兑换新增【秘境产出】：离线 / 在线各一枚按钮，1 小时换 1 小时（SEC_EX_COST = 1）。
+         2.22：所有时间兑换改为 2 小时换 1 小时产出（消耗 ×2，产出公式不变）。
+            产出 = 按当前秘境层数与当前战力挂机 1 小时的实测口径（内力 / 凡尘宝箱 / 化肥 / 种子 / 灵魂），
+            击杀速率与分身预估 _cloneKphFor 同算法但不乘 FR_CLONE_RATE —— 自己的时间换自己的产出，不再打折。
+            内力逐层累加（上限 SEC_EX_SCAN_MAX = 3000 层，超出部分按末段 10 层均值线性外推，防卡死主线程）；
+            其余按每次击杀期望值取整，化肥 / 种子单次最多各发 20 份。
+            ★ 不推进秘境层数：否则会与手动 secretKill / 分身 cloneSecretStep 抢同一份层数与血量
+              （玩家打掉一半血的怪被 secretInit() 换掉，表现为「血条莫名满血」）。
+         ③ 每日任务需求量大幅提高：「轮回十转」10 → 100 次（更名【轮回百转】）、
+            「耕云种药」10 → 100 次。分身可自动转生、药园可一键播种，原 10 次在中期即可
+            瞬间刷满无数轮，宝箱等于白送。
+         ④ 每日任务新增【静修悟道】：累计在线 2 小时 → 奖励离线时间 1 小时。
+            进度在在线时间累加处挂钩（questAdd('ontime', 1/60)），记录真实在线时长、
+            不受时间库存上限截断影响（否则在线时间攒满后进度永久停摆）；
+            奖励经 addOffTime 发放，受库存上限约束，满仓时提示溢出。
+            QUESTS 新增 off 字段：off 类奖励不吃 achBoxOut() 成就加成（时间是时间，不参与产出膨胀）；
+            claimQuest / claimAllQuests / renderQuest 三处同步支持；进度显示对 need < 10 的任务保留 1 位小数。
+   2.10  补齐后期资源向内容（内力 / 凡尘宝箱 / 药园种子 / 丹药）—— 原表这三类的加成几乎全部
+         集中在 10 万~150 万档，后期没有任何可买目标，种田流与资源流后期完全断线：
+         ① 功法 +6 本：灵田诀（种子 +120%，300 万）、太虚纳灵典（内力 +500%，5000 万）、
+            万宝归元诀（宝箱 +400%，6000 万）、神农灵田经（种子 +600%，8000 万）、
+            鸿蒙纳灵诀（内力 +1800%，15 亿）、混沌聚宝典（宝箱 +1200%，20 亿）。
+         ② 宠物 +4 只：稼穑灵麟（种子 +250%，3000 万）、太虚灵鲸（内力 +2000%，3 亿）、
+            太虚仓廪兽（种子 +1000%，5 亿）、混沌宝猊（宝箱 +800% / 种子 +600%，8 亿）。
+         ③ 宝物 +7 件：神农灵田印 4 亿、太虚纳灵瓶 6 亿、万宝归元塔 9 亿、丹灵宝鼎 20 亿、
+            太古丰穰图 50 亿、混沌灵源 80 亿、混沌聚宝盆 100 亿；破界神锋（100 亿）移至末尾，
+            宝物表恢复价格升序。
+         ④ 遗物 +1 件：穰穰遗物（种子收获 +120%，产出类·仙品）—— 产出组此前不覆盖药园产量。
+         ⑤ 接入加成池：新增 seedPct() / pillPct()，四源相加（宝物 + 功法 + 宠物 + 遗物），
+            并接入 farmGemMul / farmPillOut —— 原先两者分别只吃宝物与阶数。
+         ⑥ GF_SET_OF_KEY 补 seed / pill → 灵道；灵道功法 15 → 21 本，门槛 5/9/14 → 5/11/18，
+            保持与原 14/15 相近的达成难度，避免新增功法导致满档白送。
+   2.09  ① 破防放大改为「每多 1 点 +0.1 倍」—— 线性、无上限：新增常量 IGN_AMP_PER = 0.1，
+         取代原「每点 ×10」。实测 ignRaw / ignAmp：
+         前期 181 → ×9.1（旧 ×1810）、中期 2013 → ×192（旧 ×1.9 万）、
+         后期 7340 → ×725（旧 ×7.3 万）、满配 28120 → ×2803（旧 ×28 万），统一削 100 倍。
+         仍无上限，破防越高收益线性越高；满配持有 / 不持有该宝物 DPS 为 17.26Oc / 6.16Sp。
+         ② 破界神锋重新定价：cost 1 亿 → 100 亿（品质档由神品升到仙品，面板显示 30 亿 → 1.2 万亿，
+         为次贵宝物混沌太极图 3000 亿的 4 倍）。描述同步改为「每多 1 点伤害 +0.1 倍（线性、无上限）」，
+         原描述仍写「×10」与实际不符。
+         ③ 战斗类经脉同步削弱：MER_BREAK_COEF 1.0 → 0.15（与资源类 MER_BREAK_COEF_RES 同档）。
+         根因是二次增长 —— 穴位等级上限 ∝ 突破次数，效果再 ×(1 + 1.0×突破次数)。
+         实测（各穴 1000 级、突破 200 次）经脉攻击池 361.8 万% → 55.8 万%（削 6.5 倍）、
+         暴伤池 603 万% → 93 万%、攻速池 150.75 万% → 23.25 万%；
+         资源类（内力 / 宝箱）本就是 0.15，不受影响。
+         注：削后经脉攻击池仍为其余系统之和的数倍，若需进一步拉近可继续下调该系数。
+   2.08  ① 内力改大数存储：S.neili 由普通 Number 改为大数 {m,e}（新增 nlD / nlAdd / nlHas / nlPay 读写层），
+         彻底解除 9.007e15 上限 —— 原上限并非设计意图，而是 Number.MAX_SAFE_INTEGER 的精度天花板，
+         超过后 1e16+1 === 1e16，加减法静默失效（刷到手的内力加不进去、兑换时扣不掉）。
+         实测 2e20 连加两次仍精确，支付 5e19 后正确余 1.5e20；旧档为普通数字时 nlD() 自动兼容。
+         ② 经脉 / 遗物突破「改线性」（2.07 已完成）后仍显夸张，本版继续压平：
+         经脉 —— 穴位等级上限随突破 +10/次 → +5/次；资源类经脉（内力 / 凡尘宝箱）
+         突破系数单独降为 MER_BREAK_COEF_RES = 0.15（战斗类仍 1.0），
+         满配内力池 732 万% → 58.3 万%（削 12.6 倍），宝箱池 244 万% → 19.3 万%。
+         遗物 —— 产出类遗物（c === 'src'）突破降为 RELIC_AD_COEF_RES = 0.25（战斗类仍 1.0）。
+         ③ 种子 / 内力 / 凡人宝箱各项加成直接削百分比（不用饱和度）：
+         功法高阶 纳灵大法 200→100、万灵归元 600→250、乾坤妙手 150→80、造化聚宝诀 400→180；
+         宝物 纳灵玉佩 1000→400、丰登宝印 500→200、聚宝琉璃盏 100→50；
+         宠物 混沌玄龟 内力 2000→800、宝箱 600→250；BOSS 内力奖励 25→12；
+         药园基础系数 等级 0.10→0.08、阶段 1.5→1.2。
+         低阶项（聚灵诀 / 金刚不坏 / 探囊取物 / 玄冥龟 / 寻宝灵鼠 / 成就 / 称号）一律不动 ——
+         前期实测内力 ×15.1、宝箱 ×5.4、种子 ×33，与改动前同档。
+         ④ 修 bug：遗物突破日志仍按 Math.pow(2, 次数) 打印「效果翻倍」，
+         与实际线性加成不符（已改为 1 + 系数×次数）；经脉突破日志未区分资源类系数。
+         ⑤ 测试版补齐：内力大数读写层、lmgPowerFromNeili 大数取整、经脉 MER_BREAK_MAX 100→200
+         与消耗改多项式（原指数 1.8^broke / 2.2^broke）、遗物 RELIC_BREAK_MAX 29→100 与线性突破。
+   2.05  ① 凡尘宝箱掉落再砍一刀：主线 BOX_DROP_MAIN 0.035 → 0.02、双塔 0.04 → 0.025。
+         ② 每日任务「寻箱探秘」目标 30 → 100 个凡尘宝箱（描述同步）。
+         ③ 修 bug：分身秘境产出预估 frCloneSecretGainPH() 仍用旧的宝箱率 0.18 且乘攻速系数，
+         与 2.03 后的实际（0.045、掉落不再吃攻速加成）不一致 —— 面板显示的预估高于真实产出。
+         同时把内联魔数 0.045 抽成 SEC_BOX_BASE，供结算与预估共用同一份数值。
+   2.04  秘境内力基础砍半：SEC_NL_SCALE 0.7 → 0.35（作用于线性项 + 幂项之和）。
+         单层基准实测（首通、非首领层）：100 层 1101 → 550、1000 层 11794 → 5897、
+         10000 层 137050 → 68525；首领层（×5）1000 层 58970 → 29485。
+         累计 1~10000 层总量 6.61 亿 → 3.31 亿，各层数口径统一 ×0.500，为整体平移不分层数。
+   2.03  ① 遗物升级 / 突破：高品质所需大幅拉开 —— RELIC_Q_MUL [1,4,20,150,1500] → [1,8,80,1200,25000]。
+         实测凡品升 1 级 10 碎片 / 仙品 25 万；突破碎片 200 → 5M、宝石 5000 → 1.25 亿。
+         ② 凡人界攻速「所有来源」削弱：FR_APS_NERF 0.70 → 0.35，并同步下调各来源原始值
+         —— 宝物 -60%、天赋约 -50%、宠物 -50%、称号 -50%、成就攻速约 -41%、
+         丹药系数 0.5 → 0.25、灵脉共鸣 MAI_RESO_SPD_SCALE 0.3 → 0.15、
+         兵器攻速词条新增 WEAP_SPD_NERF ×0.5。满配攻速实测约 388 → 78.4 次/秒。
+         ③ 秘境不再锁攻速：realAps() 原给秘境返回「由 fps 固定的间隔」（2~6.25 次/秒），
+         等于把玩家堆的攻速在秘境里完全作废；现与其他模式同用 calcAps()，
+         并由 secretTick() 按攻速批量结算本 tick 的攻击次数（上限 SEC_TICK_MAX=200），
+         做到「面板攻速 = 秘境实际输出」，不再有面板与实战两套数。
+         ④ 秘境掉落不再吃攻速加成：secApsMul() 恒返回 1（原攻速 78 时 ×5.15）。
+         ③ 已让击杀数随攻速增长，掉落若再乘一次攻速即为双重放大，故取消。
+         ⑤ 秘境掉率再削：凡尘宝箱 8% → 4.5%、化肥 0.0005 → 0.00028、种子 0.0045 → 0.0025；
+         凡人界宝箱 主线 5% → 3.5%、双塔 6% → 4%。
+   2.02  产出端整体再削弱（宝石 / 内力 / 宝箱 / 化肥 / 种子），商店直购价重标定。
+         ① 药园种子宝石产出再砍半（九档 gem 全部 ×0.5：鸿蒙籽 10000 → 5000）。
+         ② 秘境掉落四项同削：凡尘宝箱 18% → 8%、化肥 0.11% → 0.05%、
+            种子 1% → 0.45%、内力幂项系数 SEC_NL_COEF 2 → 1.2（-40%）。
+         ③ 凡人界宝箱掉率再砍半：主线 11% → 5%、双塔 13% → 6%。
+         ④ 商店直购：凡尘宝箱 60 → 10000 宝石、遗物碎片 120 → 5000 宝石
+            （原定价远低于开箱期望收益，可无脑套利，已按开箱产出重新标定）。
+   2.00  ① 凡人修为改「阶梯增长」（不再随挂机逐关连续上涨）：
+         frBondRaw 先把进度按各项 step 向下取整，只有整档跨过才跳一次，档位之间完全不动
+         —— 主线 500 关跳一次、1000 关跳一次，中间推再多关也不涨（实测 0/499 关同值、
+         500/999 关同值）。步长按数量级分别设定：主线 / 双塔 / 秘境 500、BOSS 通关 100、
+         经脉突破 50、药园阶段 2；资源组（封顶口径）同步阶梯化。
+         面板逐项显示「第 N 档 · 下档 X」，跳档点一眼可见。
+         ② 药园排版：档位条原被塞进 .fm-btns（与「升级 / 进阶」同排 flex），
+         4 个档位按钮 + 提示文字被压成 1/3 宽导致错乱 —— 改为独占整行。
+         ③ 药园升级按钮原无论档位多大都写「Lv.a → a+1」，与批量升级不符 ——
+         改为按档位试算（farmUpPlan）显示「升级 ×10 · Lv.5 → 15（总价 N）」。
+   1.99  升级档位统一为「顶部选择」：
+         原 ×10 / MAX / 一键升满 / +10 等按钮散落在每张卡片底部，后期条目一多非常占屏。
+         新增通用组件 stepBar（UI_STEPS = ×1 / ×10 / ×100 / MAX），各面板顶部统一选择档位，
+         点一次即按档位连升；每面板独立记忆，互不影响；MAX 档受 UI_BATCH_MAX=2000 保护。
+         覆盖 7 处：灵界修炼、凡人界属性、遗物、符文喂养、药园、洞府、职业技能；
+         灵脉 maiStepBar 也改为复用同一组件，样式与行为完全统一。
+         凡人界属性卡片按钮由 4 个（重置/+10/+1/自定义）精简为 3 个（重置/升级/自定义），
+         成本行改显示「当前档位总价」；灵界修炼卡片同理并显示「本次可升 N 级」。
+         顺带修复：renderAttrList 对未构建的属性卡片未判空，早期调用 render() 会整帧中断。
+   1.96  灵天赋 / 矿脉 / 灵脉 / 抽取 四项调整：
+         ① 灵天赋品质倒挂修复：神品权重远高于仙品、极易叠到 Lv.5，
+            原数值下「神品 Lv.5 = atk +325%」反而压过「仙品 Lv.1 = +195%」。
+            仙品原始值 ×2.2 后，仙品 Lv.1（+429%）已强于神品满级（+276%）；
+            防御同理（仙 Lv.1 +1430 > 神 Lv.5 +780）。
+            抽取权重 [45,30,17,6,2] → [46,29,17.5,6,1.5]，神:仙 由 3:1 拉到约 3.7:1
+            （实测 2 万次：凡 45.7% / 灵 29.0% / 玄 17.9% / 神 5.8% / 仙 1.6%）。
+         ② 矿产出削弱：每小时基数 400/240 → 240/144（-40%）、等级系数 0.7 → 0.55、
+            品质倍率 [1,3,9,26,80] → [1,2.4,6,15,42]（神 -42%、仙 -48%）。
+            高品质保底 2 处 → 10 处，矿点数同步 6 → 12 以容纳保底
+            （实测 200 次刷新：高品质平均 10.00 处、保底失败 0 次）。
+         ③ 灵脉小节点削弱 / 大节点增强：小节点每级加成 ×0.6
+            （凡 atk 100→60、灵 atk 22→13 等）；大节点 MAI_BIG_SOLO 0.7→1.4、
+            MAI_BIG_SOLO_ATTR 1.4→2.8、共鸣 MAI_RESO_PER 0.07→0.09。
+            两级成本各 +20%：小节点基价 30/90 → 36/108、指数 1.4→1.43；
+            大节点基价 230/700 → 276/840、指数 1.85→1.88。
+            新增批量升级档位：小节点 / 大节点面板顶部 +1 / +10 / +100 / MAX，
+            选档后点一次即连升多级（MAX 受 MAI_BATCH_MAX = 2000 约束）；
+            按钮直接显示「实际可升级数 · 总花费」（maiPlan 试算，不真实扣资源）。
+         ④ 灵魂感悟每级加成 0.25 → 0.45；灵兽抽取费用 ×3.2
+            （灵石单抽 2500→8000、十连 25000→80000、百连/千连同口径）；
+            魂召灵兽 1200/12000 → 4000/40000。
+         ⑤ 移除「魂召 · 法宝」抽取（函数与面板卡片均已删除），魂召只保留灵兽。
+         ⑥ 清理 12 处堆叠的冗余版本注释（同一常量后挂 3~5 条「1.xx：…」），
+            只保留最新说明与功能性注释。
+   1.94  灵脉节点取消上限 + 每级加成翻倍 + 消耗提高：
+         ① 小节点取消等级上限（原 MAI_SMALL_MAX_LV = 300）、大节点取消等级上限（原 MAI_BIG_MAX = 1000）；
+            共鸣上限同步解除（maiResoMax() 返回 null），面板显示「无上限」。
+            旧档兼容：maiBigLv() 读回时 clamp 到「绑定小节点 ÷ 10」，避免残留等级超出绑定上限。
+         ② 每级加成 ×2 —— 凡脉 atk/hp/cdm 50→100、crit 5→10、fdm 30→60、psn 20→40、ign 3→6；
+            灵脉 atk/hp/def/hit 11→22、cdm 22→44、pen 5.5→11、dodge 2.2→4.4；
+            大节点 MAI_BIG_SOLO 0.35→0.7、MAI_BIG_SOLO_ATTR 0.7→1.4。
+         ③ 每级消耗提高 —— 小节点基价 20/60 → 30/90、成本指数 1.25 → 1.4；
+            大节点基价 150/450 → 230/700、成本指数 1.6 → 1.85。
+            实测单级成本：小节点 Lv100 ×3.9、Lv300 ×5.2、Lv1000 ×6.9；大节点 Lv50 ×4.1、Lv300 ×6.4。
+            取消上限后靠成本曲线自然收敛，不再硬性夹断。
+         ④ 性价比实测（同等资源预算下的总加成，新 ÷ 旧）：
+            预算 1e6 → ×1.25、1e7 → ×1.18、1e8 → ×1.10、1e9 → ×1.04 ——
+            全程为「加强」，且后期逐渐收敛至持平（成本曲线更陡，抵消了加成翻倍）。
+   1.93  矿脉加强 + 内力曲线再压平：
+         ① 矿脉产出全面加强 —— 每小时基数 ×2（凡 200→400、灵 120→240）；
+            等级加成系数 0.5 → 0.7（MAI_OUT_LV_K）；品质倍率高档再拉开
+            [1,2.5,6,14,32] → [1,3,9,26,80]（神 14→26、仙 32→80）。
+            综合（同等级口径）凡品约 ×2.8、玄品约 ×4.2、神品约 ×5.8、仙品约 ×7，
+            高档矿收益显著高于低档，占矿不再「品质无所谓」。
+         ② 高品质矿石变多 —— 出现权重 [50,26,14,7,3] → [40,25,18,11,6]
+            （神 7→11、仙 3→6），并新增每界每日保底：
+            至少 MAI_MINE_HI_MIN = 2 处「神品及以上」，不足则从品质最低的矿点
+            依次提升；补位默认给神品，仅 MAI_MINE_HI_XIAN = 0.25 概率直接给仙品，
+            仙品仍主要靠权重、保持稀有。每日刷新与手动刷新（maiMineRoll）共享同一逻辑。
+            实测 2000 次刷新分布：凡 23.9% / 灵 23.7% / 玄 17.8% / 神 24.1% / 仙 10.5%，
+            保底失败 0 次 —— 高品质（神+仙）合计由 10% 提到约 35%。
+         ③ 内力曲线 SEC_NL_POW 1.4 → 1.2 —— 1.92 改 1.4 次幂后后期仍偏多。
+            层数翻倍内力 ×2.64 → ×2.30，与灵界修炼成本 ×2.26（powCost ∝ lv^1.18）
+            几乎持平，过剩速率由约 1.17 倍/翻倍降到约 1.02 倍/翻倍。
+            相对 1.92 单层基准：100 层 0.70、1000 层 0.46、5000 层 0.32、10000 层 0.27。
+   1.89  金色 / 黄色按钮文字清晰度修复（「黄色上面的字模糊」）：
+         根因有二 ——
+         ① 按钮文字色 --panel-d2(#2c1e08) 在金色渐变底部 #b8842a 上对比度仅 4.92:1，
+            且多为 11~12.5px 小字、font-weight 默认 400（细），手机端发虚。
+         ② 更关键：全局 button 兜底带 text-shadow:0 1px 2px #000（黑色阴影），
+            而金色按钮上的字是【深色】—— 黑阴影压在深色字上既不衬托、又侵蚀字形边缘，
+            是「糊」的主要来源。
+         改法：新增 --on-gold(#150d03) 专用于金色底文字（对比度 4.92 → 5.84），
+            统一加 font-weight:600，并把阴影换成亮色描边
+            text-shadow:0 1px 0 rgba(255,246,222,.55)（深色字用亮边勾轮廓）；
+            另加全局 -webkit-font-smoothing:antialiased + text-rendering:optimizeLegibility。
+         覆盖 12 处：.tb-btn / .mer-qbtn / .mer-brk / .bs-go / .ach-claim-all / .gf-buy /
+            .wp-up / .fm-btn / .tw-challenge / .confirm-btns .ok / .pv-check.on .pv-box / .pv-agree。
+         实测：计算样式 color rgb(44,30,8)→rgb(21,13,3)、font-weight 400→600、
+            text-shadow 黑2px→亮描边；像素级对照「模糊过渡灰阶」3.5% → 0.7%（-80%），
+            字形像素 +19%，边缘更锐利。双版零报错。
+   1.88  灵兽技能CD修正：
+         ① CD 被清空：原 petCD / petLastSkill / petCutUntil 均为内存变量，
+            且 startLmgPet() 每次启动都重置为 {} —— 切回凡人界再进灵界、或刷新页面，
+            全部技能CD 立刻归零，可反复切界 / 刷新无限刷新技能。
+            实测：祖龙三技能切界前 12s / 15s，切界后全部「清空」。
+         ② CD 不存盘：主角技能CD（clsActCd）早已存档，灵兽CD 却没有 —— 口径不一致。
+         ③ 换灵兽串CD：CD 以技能 id 为键全局共享，踏云豹放完 sk_burst2（10s）后
+            换成雷翼鹰，雷翼鹰的同名技能也被带上 10s 冷却。
+         ④ 换新怪不清破防：sk_break2 的 8 秒破防 debuff 在 lmgNewMon() 后仍然生效。
+         修法：CD 改为「灵兽 key + 技能 id」两级键，存于 S.lmgPet.cd / .gcd / .cutUntil，
+            切界、刷新、换灵兽均按真实时间继续走；lmgNewMon() 清零破防。
+            读档时清理无效灵兽 / 无效技能的残留键，并丢弃超出 1 天的异常时间戳
+            （防止改系统时间导致技能永久冷却）。
+         实测：切界前后 CD 均 12s / 15s；刷新重载后保留；换灵兽各自独立不再串。
+*/

@@ -1,0 +1,3436 @@
+/* ══════════════════════════════════════════════════════════════
+   香火：两界联动 —— 把修行成果凝为香火，反哺凡人界
+
+   为什么需要它：FR_BOND 是「凡人界 6 项养成 → 灵界属性」，方向单一且算完即静止；
+   灵界对凡人界则完全没有反馈，启灵之后凡人界等于退休。香火补的就是这条反向回路，
+   与 FR_BOND 互为镜像。
+
+   获取（无上限，可重复刷）：
+     · 每次击杀 → 微量香火（随当前关卡数提升），两界都算，可无限重复；
+     · 首次达到「新纪录关」→ 一次性大额（同关重复刷只拿微量）—— 即「首次更多」。
+   刻意不做硬 cap：这是长线养成资源，靠神位成本曲线（1.010^lv）控制节奏，
+   而不是靠卡死获取上限。
+
+   消耗（供奉神位）：
+     · 百分比类神位：上限 Lv.1000（用户要求：除特殊属性外一律 1000 级）；
+     · 特殊属性（多杀上限 / 斩杀线）：整数型、收益陡峭，故独立设较低上限。
+
+   只作用于凡人界：香火加成不参与任何灵界计算，不回流，避免双向循环。
+   ══════════════════════════════════════════════════════════════ */
+const INCENSE_CAP_PCT = 1000;      /* 百分比类神位等级上限 */
+/* 供奉成本：分段递增，三段增长率逐级抬高。
+   历史：① 全程 1.010^lv（太线性，几百级就满）→ ② 1.035/1.050/1.070（前快后慢，但仍偏快）
+         → ③ 现 1.055/1.075/1.100：整体大幅拉高难度，后期陡到基本停滞。
+     Lv.0~99    ×1.055/级   起量段：仍保留「点几下就涨」的即时反馈（约到 Lv.100 花 2.6e4）
+     Lv.100~399 ×1.075/级   明显变陡，中期主要区间
+     Lv.400~999 ×1.100/级   极陡：Lv.400 单级已达 1.1e13，累计 1.5e14；
+                            约 Lv.470 起单级成本超过 2^53，统一夹到 SAFE_INT
+   SAFE_INT 夹取只影响本就不可达的深水区，对该区间玩家无差别，仅防止 Infinity / NaN
+   把购买判定搞坏。刻意不指望在当前获取途径下升满 —— 后续会新增香火获取方式。
+   段与段之间连续衔接：边界只差一个增长率因子，不跳变也不回退（已由单调性测试覆盖）。 */
+const INCENSE_COST_SEG = [
+  {at:0,   g:1.12},      /* 原 1.055 → 1.08 → 1.12：持续提高灵界系统资源消耗 */
+  {at:100, g:1.16},      /* 原 1.075 → 1.12 → 1.16 */
+  {at:400, g:1.22}       /* 原 1.100 → 1.18 → 1.22 */
+];
+/* 特殊属性（疾神·多杀上限 / 斩神·斩杀线）成本额外 ×10。
+   理由：它们是整数型、每级收益陡峭（多杀上限 +1 只、斩杀线 +0.4%），
+   与「百分比类升 1 级只加 0.5%」完全不是一个量级，必须单独加价，
+   否则玩家会无脑先把两个特殊神位拉满。此系数与 base 分离，便于单独调整。 */
+const INCENSE_SP_COST_MUL = 10;
+const INCENSE_SEATS = [
+  {k:'atk',   n:'战 神', d:'凡人界 攻击',         kind:'pct', per:0.5, base:20},
+  {k:'crit',  n:'锐 神', d:'凡人界 暴击 / 暴伤',  kind:'pct', per:0.4, base:25},
+  {k:'spd',   n:'速 神', d:'凡人界 攻速',         kind:'pct', per:0.3, base:30},
+  {k:'fdm',   n:'伤 神', d:'凡人界 最终伤害',     kind:'pct', per:0.5, base:25},
+  {k:'psn',   n:'毒 神', d:'凡人界 毒伤害',       kind:'pct', per:0.5, base:25},
+  {k:'mer',   n:'经 神', d:'经脉全部效果',        kind:'pct', per:1,   base:15},
+  {k:'tower', n:'塔 神', d:'双塔掉落',            kind:'pct', per:1,   base:15},
+  {k:'box',   n:'箱 神', d:'凡尘宝箱产出',        kind:'pct', per:1,   base:15},
+  {k:'gf',    n:'功 神', d:'功法全部效果',        kind:'pct', per:1,   base:15},
+  {k:'rb',    n:'转 神', d:'转生点获取',          kind:'pct', per:1,   base:15},
+  /* —— 特殊属性：整数型、收益陡峭，独立上限，不参与 Lv.1000 —— */
+  {k:'multi', n:'疾 神', d:'多杀上限 +1 / 级（需伤害溢出）', kind:'sp', max:100, base:200},
+  {k:'exec',  n:'斩 神', d:'斩杀线 +0.4% / 级',              kind:'sp', max:50,  base:300}
+];
+function incenseDef(k){ for(let i=0;i<INCENSE_SEATS.length;i++) if(INCENSE_SEATS[i].k===k) return INCENSE_SEATS[i]; return null; }
+function incenseMaxLv(k){ const d = incenseDef(k); if(!d) return 0; return d.kind === 'sp' ? d.max : INCENSE_CAP_PCT; }
+function incenseLv(k){
+  if(!S.incenseLv) S.incenseLv = {};
+  const mx = incenseMaxLv(k);
+  let v = Math.floor(Number(S.incenseLv[k]) || 0);
+  if(!isFinite(v) || v < 0) v = 0;
+  if(v > mx){ v = mx; S.incenseLv[k] = v; }
+  return v;
+}
+function incenseCost(k){ return incenseCost2(k, incenseLv(k)); }
+/* 百分比类神位的加成值（特殊属性不走这里） */
+function incensePct(k){
+  const d = incenseDef(k); if(!d || d.kind !== 'pct') return 0;
+  return d.per * incenseLv(k);
+}
+/* 香火余额（大数） */
+function incenseNum(){ return _toD(S.incense || D(0)); }
+/* 一次最多能买多少级（用于「MAX」按钮）。
+   上限取该神位的等级上限而非固定 200 —— 深水区成本陡增后，玩家攒够香火时
+   200 级会明显不够用（要反复点 MAX）；而这里是纯算术循环，跑到满级也只有
+   千次级 pow，开销可忽略，不会卡死。 */
+function incenseAfford(k){
+  const mx = incenseMaxLv(k);
+  let n = 0, c = incenseCost(k);
+  if(c === Infinity) return 0;
+  let have = Number(dNum(incenseNum()));
+  if(!isFinite(have)) return 0;
+  while(n < mx && c !== Infinity){
+    if(have < c) break;
+    have -= c; n++;
+    c = incenseCost2(k, incenseLv(k) + n);
+  }
+  return n;
+}
+/* 指定等级的供奉成本。分段累乘：先把前面各段整段乘完，再乘当前段的零头，
+   保证段边界处连续（Lv.99→100 只差一个 ×1.035 与 ×1.050 的因子，不跳变）。 */
+function incenseCost2(k, lv){
+  const d = incenseDef(k); if(!d) return Infinity;
+  const mx = incenseMaxLv(k);
+  if(lv >= mx) return Infinity;
+  /* 幂函数：base × (lv+1)^k（原为分段指数，后期会撞 SAFE_INT 被夹死在 9.01Qa） */
+  let c = d.base * LMG_COST.inc.mul * (d.kind === 'sp' ? INCENSE_SP_COST_MUL : 1) * Math.pow(lv + 1, LMG_COST.inc.k);
+  if(!isFinite(c) || c <= 0) return SAFE_INT;
+  /* 后期成本远超 2^53，普通 Number 会丢精度 —— 这里只作为「数量级门槛」使用，
+     故统一夹到 SAFE_INT，避免 Infinity / NaN 把购买判定搞坏。 */
+  return Math.max(1, Math.min(SAFE_INT, Math.round(c)));
+}
+function incenseBuy(k, n){
+  const d = incenseDef(k); if(!d) return;
+  const mx = incenseMaxLv(k);
+  let lv = incenseLv(k);
+  if(lv >= mx){ toast('【' + d.n + '】已达上限 Lv.' + mx); return; }
+  n = Math.max(1, Math.floor(n) || 1);
+  let total = 0, buy = 0;
+  for(let i=0;i<n && (lv+buy) < mx;i++){ total += incenseCost2(k, lv + buy); buy++; }
+  if(buy <= 0) return;
+  if(dcmp(incenseNum(), D(total)) < 0){
+    toast('香火不足，需 ' + nStr(total) + '（当前 ' + dStr(incenseNum()) + '）'); return;
+  }
+  S.incense = dsub(incenseNum(), D(total));
+  S.incenseLv[k] = lv + buy;
+  toast('【' + d.n + '】Lv.' + (lv + buy) + (buy > 1 ? ('（+' + buy + '）') : '') + '　消耗香火 ' + nStr(total));
+  logMsg('供奉【' + d.n + '】→ Lv.' + (lv + buy));
+  renderIncense(); renderNow(true); save();
+}
+
+/* ---------- 多杀 / 斩杀线：特殊属性出口 ----------
+   多杀：只有「本次攻击的伤害确实溢出、打穿了当前怪物」才会继续斩杀后续怪物。
+   下一只怪血量按 BASE_GROW(1.062)^关卡 递增，因此能连斩几只完全由伤害溢出量决定，
+   碾压越深连斩越多、卡关时自动退化为 1 只 —— 天然收敛，不需要额外门槛。 */
+function multiKillCap(){ return 2 + incenseLv('multi'); }
+function incenseExecLine(){ return incenseLv('exec') * 0.4; }
+
+/* ---------- 获取：击杀（可重复，无上限）+ 首次新纪录更多 ---------- */
+function incenseOnKill(isNew){
+  const lv = (S.realm === 'lmg') ? (S.lmgLevel || 1) : (S.level || 1);
+  let g = 1 + Math.floor(lv * 0.02);          /* 重复刷关：微量，无上限 */
+  if(isNew) g += Math.floor(lv * 3);          /* 首次新纪录：明显更多 */
+  S.incense = dadd(incenseNum(), D(g));
+  if(isNew) S.incenseFirst = (S.incenseFirst || 0) + 1;
+  return g;
+}
+
+/* ---------- 面板 ---------- */
+function openIncense(){
+  /* 顺序不能反：renderIncense() 有「面板未显示则 return」的守卫（挡掉关着时的无谓重绘），
+     先 render 再 show 会导致首次打开内容为空。 */
+  $('incenseOverlay').classList.add('show'); renderIncense();
+}
+function closeIncense(){ const o = $('incenseOverlay'); if(o) o.classList.remove('show'); }
+function renderIncense(){
+  const ov = $('incenseOverlay'); if(!ov || !ov.classList.contains('show')) return;
+  const v = $('incenseVal'); if(v) v.textContent = dStr(incenseNum());
+  const box = $('incenseSeatList'); if(!box) return;
+  const have = incenseNum();
+  let h = '';
+  INCENSE_SEATS.forEach(function(d){
+    const lv = incenseLv(d.k), mx = incenseMaxLv(d.k), maxed = (lv >= mx);
+    const c1 = incenseCost(d.k);
+    const c10 = incenseCost2(d.k, lv) * 0; let c10s = 0;
+    for(let i=0;i<10 && (lv+i)<mx;i++) c10s += incenseCost2(d.k, lv + i);
+    const aff = incenseAfford(d.k);
+    const val = (d.kind === 'sp')
+      ? (d.k === 'multi' ? ('多杀上限 ' + multiKillCap() + ' 只') : ('斩杀线 ' + (incenseExecLine()).toFixed(1) + '%'))
+      : (d.k === 'tower'
+          ? ('凡人塔转生点 +' + incensePct(d.k) + '% · 神兵塔碎片 +' + incensePct(d.k) + '%')   /* 双塔同时加成，分别列出 */
+          : ('+' + incensePct(d.k) + '%'));
+    const btn = function(n, cost, label){
+      const ok = !maxed && cost > 0 && dcmp(have, D(cost)) >= 0;
+      return '<div class="fs-btn ' + (ok ? 'b-gold' : 'b-brown') + '" data-cost="' + (maxed ? -1 : cost) + '" onclick="' + (maxed ? '' : ('incenseBuy(\'' + d.k + '\',' + n + ')')) + '"><span>' + label + '</span></div>';
+    };
+    h += '<div class="ic-seat">'
+      +  '<div class="ic-sh"><span class="ic-sn">' + d.n + '</span>'
+      +  '<span class="ic-sl">Lv.' + lv + ' / ' + mx + '</span></div>'
+      +  '<div class="ic-sd">' + d.d + '　<b>' + val + '</b>'
+      +  (d.kind === 'pct' ? ('　每级 +' + d.per + '%') : '') + '</div>'
+      +  '<div class="ic-sb">'
+      +  btn(1, c1, maxed ? '已 满 级' : ('+1 · ' + nStr(c1)))
+      +  (maxed ? '' : btn(10, c10s, '+10 · ' + nStr(c10s)))
+      +  (maxed ? '' : btn(Math.max(1, aff), (aff > 0 ? (function(){ let t=0; for(let i=0;i<aff;i++) t += incenseCost2(d.k, lv+i); return t; })() : 0), 'MAX'))
+      +  '</div></div>';
+  });
+  box.innerHTML = h;
+  const sm = $('incenseSum');
+  if(sm){
+    let tot = 0, maxed = 0;
+    INCENSE_SEATS.forEach(function(d){ tot += incenseLv(d.k); if(incenseLv(d.k) >= incenseMaxLv(d.k)) maxed++; });
+    sm.innerHTML = '神位总等级 <b class="hi">' + tot + '</b>　已圆满 <b class="hi">' + maxed + '</b> / ' + INCENSE_SEATS.length
+      + '<br><span style="font-size:11px">击杀积累香火（无上限）· 仅凡人界</span>';
+  }
+}
+/* 轻量刷新：只更新香火数与按钮可用态，不重建 DOM（render 每帧调用） */
+function incenseRefresh(){
+  const ov = $('incenseOverlay'); if(!ov || !ov.classList.contains('show')) return;
+  const v = $('incenseVal'); if(v) v.textContent = dStr(incenseNum());
+  const box = $('incenseSeatList'); if(!box) return;
+  const have = incenseNum();
+  Array.prototype.forEach.call(box.querySelectorAll('[data-cost]'), function(e){
+    const c = Number(e.getAttribute('data-cost'));
+    if(c < 0) return;
+    const ok = dcmp(have, D(c)) >= 0;
+    e.classList.toggle('b-gold', ok);
+    e.classList.toggle('b-brown', !ok);
+  });
+}
+
+/* ══════════════════════════════════════════════════════════════
+   幽冥魂殿：灵魂的唯一消费入口（只在灵界开放）
+   · 魂契 —— 灵魂买永久属性成长，是平行于「灵力升级」「修真」的第三条成长线
+   · 魂市 —— 灵魂按比例兑换灵界资源（灵石 / 灵力 / 经验 / 洗练石 / 心魔票）
+   · 魂召 —— 灵魂抽取灵兽碎片（与灵石抽取共用碎片池，但权重更优）
+
+   为什么必须存在：灵魂（S.soul）此前只在「修真突破」一处消耗，主线/秘境/塔/
+   BOSS/离线/洞府/分身七条产线全在产，玩家攒到天文数字却无处可花，资源等于装饰。
+   这里一次性把出口铺满，且所有收益严格限定在灵界 —— 凡人界公式一行不动。
+   ══════════════════════════════════════════════════════════════ */
+const SOUL_PACT_MAX  = 40;      /* 每条魂契等级上限 */
+/* 成本曲线：1.28^lv。单条全满约 2e7、10 条合计约 2e8 灵魂 —— 刻意压在「修真」（全破约 1e15）
+   之下好几个数量级，让魂契成为「前期就能点、中期能铺满」的养成线，修真仍是长线目标；
+   两者争夺同一份灵魂，形成取舍而非互斥。
+   效果本身严格线性（每级固定增量），绝不做复利 —— 与全局「反指数」基调一致。 */
+const SOUL_PACT_GROW = 1.85;   /* 原 1.28 → 1.55 → 1.85：持续提高灵界系统资源消耗 */
+/* k 与 LMG_ATTR 一一对应，由 soulPactSum / soulPactPct / soulPactFix 三种口径接入 lmgAttrD()：
+     exp → 百分比乘区（atk / hp / def / spd）      per 为「每级 +N%」
+     pct → 百分点直加（crit / cdm / gp / gs / gu）  per 为「每级 +N 个百分点」
+     fix → 点数直加（pen）                          per 为「每级 +N 点」
+   base = 0 级升 1 级的灵魂成本；战斗属性贵、资源属性便宜，逼玩家做取舍。 */
+/* 1.66：exp 类（攻/血/防/速）由「并入加法池」改为「独立乘区」。
+   旧口径下 per 是相对属性 base 的百分比 —— 血量 base 仅 1000，而加法池总量常达数千 %，
+   于是面板写着「灵界血量 +30%」，玩家按当前血量理解（以为 +1.9 万），实际只涨 1000×30%=300 点。
+   改乘区后「+N%」= 当前值的 N%，名副其实；per 同步下调（40 级满级约 ×3.4 / ×3.0 / ×1.6）。
+    1.67：再由「各自单独相乘」改为与职业同进「统一加成桶」—— 两系统叠乘的交叉项被消除，
+    以后新增乘区系统只做线性相加、不会指数爆炸；桶整体另乘 LMG_ZONE_SCALE 削弱。 */
+/* 1.68：per 已就地下调 ×0.7（取代全局 ZONE_SCALE），每条可单独微调 */
+const SOUL_PACTS = [
+  {k:'atk',   n:'噬魂锋', base:300, per:4,    kind:'exp', d:'灵界攻击'},   /* 6 → 4 */
+  {k:'hp',    n:'冥王躯', base:260, per:4,    kind:'exp', d:'灵界血量'},   /* 6 → 4 */
+  {k:'def',   n:'幽冥骨', base:240, per:3.5,  kind:'exp', d:'灵界防御'},   /* 5 → 3.5 */
+  {k:'spd',   n:'疾魂步', base:400, per:1,    kind:'exp', d:'灵界攻速'},   /* 1.5 → 1 */
+  {k:'crit',  n:'破妄眼', base:500, per:0.3,  kind:'pct', d:'灵界暴击'},   /* 0.4 → 0.3 */
+  {k:'cdm',   n:'裂魂爪', base:320, per:18,   kind:'pct', d:'灵界暴伤'},   /* 25 → 18 */
+  {k:'pen',   n:'穿魂刺', base:280, per:8,    kind:'fix', d:'灵界穿透'},   /* 12 → 8 */
+  {k:'gp',    n:'汲灵诀', base:200, per:10,   kind:'pct', d:'灵力汲取'},   /* 1.75：14 → 10 */
+  {k:'gs',    n:'寻魄术', base:200, per:10,   kind:'pct', d:'灵石寻获'},   /* 1.75：14 → 10 */
+  {k:'gu',    n:'悟魂篇', base:220, per:13,   kind:'pct', d:'灵魂感悟'}    /* 1.75：18 → 13 */
+];
+function soulPactDef(k){ for(let i=0;i<SOUL_PACTS.length;i++) if(SOUL_PACTS[i].k===k) return SOUL_PACTS[i]; return null; }
+function soulPactLv(k){
+  if(!S.soulPact) S.soulPact = {};
+  let v = Math.floor(Number(S.soulPact[k]) || 0);
+  if(!isFinite(v) || v < 0) v = 0;
+  if(v > SOUL_PACT_MAX){ v = SOUL_PACT_MAX; S.soulPact[k] = v; }   /* 惰性收敛：改档超限自动压回 */
+  return v;
+}
+/* 升到下一级的灵魂成本；已满级返回 Infinity（调用方据此判断） */
+function soulPactCost(k){
+  const d = soulPactDef(k); if(!d) return Infinity;
+  const lv = soulPactLv(k);
+  if(lv >= SOUL_PACT_MAX) return Infinity;
+  return Math.min(SAFE_INT, Math.round(soulPactCostNum(d.base * LMG_COST.pact.mul, lv)));
+}
+/* 幂函数成本的 Number 版（魂契用普通数字结算） */
+function soulPactCostNum(base, lv){
+  const f = base * Math.pow(lv + 1, LMG_COST.pact.k);
+  if(!isFinite(f) || f <= 0) return SAFE_INT;
+  return f;
+}
+/* ---- 三种口径的加成读取（供 lmgAttrD 接入）---- */
+function soulPactSum(k){ const d = soulPactDef(k); return (d && d.kind === 'exp') ? d.per * soulPactLv(k) : 0; }
+function soulPactPct(k){ const d = soulPactDef(k); return (d && d.kind === 'pct') ? d.per * soulPactLv(k) : 0; }
+function soulPactFix(k){ const d = soulPactDef(k); return (d && d.kind === 'fix') ? d.per * soulPactLv(k) : 0; }
+/* 魂契已投入的灵魂总量（面板统计用，不是可退资源） */
+function soulPactSpent(){
+  let s = 0;
+  for(let i=0;i<SOUL_PACTS.length;i++){
+    const d = SOUL_PACTS[i], lv = soulPactLv(d.k);
+    for(let j=0;j<lv;j++) s += Math.min(SAFE_INT, Math.round(d.base * Math.pow(SOUL_PACT_GROW, j)));
+  }
+  return s;
+}
+/* 1.66：魂契预览 —— 「当前值 → 再升 1 级后的值」。
+   玩家真正关心的是「我的血从多少变多少」，而不是一个会被加法池稀释的百分数。 */
+function soulPactPreview(k){
+  const d = soulPactDef(k);
+  if(!d || d.kind !== 'exp') return null;
+  if(soulPactLv(k) >= SOUL_PACT_MAX) return null;
+  /* 1.67：魂契已进「统一加成桶」，且与职业共享同一个桶 —— 预览必须按桶口径算，
+     不能再用旧的 (100+sum+per)/(100+sum)（那是各自单独相乘时的公式，会高估）。
+     桶倍率 = 1 + (职业% + 魂契%) × LMG_ZONE_SCALE / 100 */
+  const zone = clsPct(k) + soulPactSum(k);
+  const m0 = 1 + zone * LMG_ZONE_SCALE / 100;
+  const m1 = 1 + (zone + d.per) * LMG_ZONE_SCALE / 100;
+  const now = _toD(lmgAttrD(k));
+  const nxt = dmul(now, D(m1 / m0));
+  return { now: now, next: nxt };
+}
+function soulPactBuy(k){
+  if(!S.lmgUnlocked){ toast('启灵后开启'); return; }
+  const d = soulPactDef(k); if(!d) return;
+  const lv = soulPactLv(k);
+  if(lv >= SOUL_PACT_MAX){ toast('【' + d.n + '】已达上限 Lv.' + SOUL_PACT_MAX); return; }
+  const c = soulPactCost(k);
+  if(!resHas('soul', c)){ toast('灵魂不足，需 ' + nStr(c) + '（当前 ' + dStr(resD('soul')) + '）'); return; }
+  S.soul = resHas('soul', c) ? dsub(resD('soul'), D(c)) : D(0);
+  S.soulPact[k] = lv + 1;
+  logMsg('幽冥魂契【' + d.n + '】升至 Lv.' + (lv + 1) + '（' + d.d + ' +' + d.per + '，消耗灵魂 ' + nStr(c) + '）');
+  toast('【' + d.n + '】Lv.' + (lv + 1) + '　' + d.d + ' +' + d.per);
+  renderSoulShrine(); renderNow(true); save();
+}
+
+/* ---------- 魂市：灵魂换灵界资源 ----------
+   amt 为「每份」的资源量，会随灵界关卡线性放大（否则后期一次兑换毫无意义）；
+   票券类（洗练石 / 心魔票）不放大 —— 它们本身就是稀有硬通货，放大等于通胀。 */
+const SOUL_MARKET = [
+  {k:'stone',  n:'灵 石',     cost:1200, amt:150, scale:1, d:'灵兽 / 法宝强化硬通货'},
+  {k:'power',  n:'灵 力',     cost:1500, amt:200, scale:1, d:'灵力升级主属性用'},
+  {k:'pexp',   n:'灵兽经验',  cost:900,  amt:60,  scale:1, d:'进经验池，喂养灵兽升级'},
+  {k:'plexp',  n:'主角经验',  cost:900,  amt:60,  scale:1, d:'进主角经验池，自动升级'},
+  {k:'shard',  n:'洗练石',    cost:9000, amt:1,   scale:0, d:'法宝洗练词条用'},
+  {k:'ticket', n:'心魔票',    cost:30000,amt:1,   scale:0, d:'挑战心魔用（原仅妖王掉落）'}
+];
+/* ===== 1.48：魂市单价递增 =====
+   原为固定单价，灵魂一多就能无限换，资源通胀失去稀缺性。
+   改为「每买 1 份，下一份单价 ×1.08」，累计兑换越多越贵，天然形成软上限；
+   同时把基准单价整体上调、单份产出下调（原 150 灵魂换 300 灵石明显偏高）。
+   SOUL_MKT_MAXMUL 封顶：不封的话买满几百份后 Math.pow 会溢出成 Infinity。 */
+const SOUL_MKT_GROW   = 1.08;
+const SOUL_MKT_MAXMUL = 1e6;
+function soulMarketBought(k){ return (S.soulBuy && S.soulBuy[k]) || 0; }
+function soulMarketUnit(it, idx){
+  const mul = Math.min(SOUL_MKT_MAXMUL, Math.pow(SOUL_MKT_GROW, Math.max(0, idx || 0)));
+  return Math.round(it.cost * mul);
+}
+/* 一次买 n 份的总价：逐份累加（几何级数），不是「单价 ×n」——
+   后者会让连买 100 份只按第 1 份计价，递增形同虚设。 */
+function soulMarketCost(it, n, bought){
+  let t = 0;
+  for(let i = 0; i < n; i++) t += soulMarketUnit(it, (bought || 0) + i);
+  return t;
+}
+function soulMarketDef(k){ for(let i=0;i<SOUL_MARKET.length;i++) if(SOUL_MARKET[i].k===k) return SOUL_MARKET[i]; return null; }
+/* 单次「份」的产出量：随灵界当前关线性放大（第 1 关为基准量） */
+function soulMarketAmt(it){
+  const lv = Math.max(1, S.lmgLevel || 1);
+  return it.scale ? Math.max(1, Math.round(it.amt * (1 + lv))) : it.amt;
+}
+function soulMarketBuy(k, n){
+  if(!S.lmgUnlocked){ toast('启灵后开启'); return; }
+  const it = soulMarketDef(k); if(!it) return;
+  n = Math.max(1, Math.floor(n) || 1);
+  const _bought = soulMarketBought(k);
+  const cost = soulMarketCost(it, n, _bought);        /* 1.48：递增总价 */
+  if(!resHas('soul', cost)){ toast('灵魂不足，需 ' + nStr(cost) + '（当前 ' + dStr(resD('soul')) + '）'); return; }
+  const amt = soulMarketAmt(it) * n;
+  S.soul = resHas('soul', cost) ? dsub(resD('soul'), D(cost)) : D(0);
+  if(k === 'stone'){
+    S.lmgStone = Math.min((S.lmgStone || 0) + amt, SAFE_INT);
+  } else if(k === 'power'){
+    S.lmgPower = dadd(_toD(S.lmgPower || D(0)), D(amt));
+  } else if(k === 'pexp'){
+    S.lmgPetExp = dadd(petExpPool(), D(amt));
+  } else if(k === 'plexp'){
+    S.lmgPExp = dadd(plvExpPool(), D(amt));
+    plvAddExp(D(0));                                /* 触发自动升级（入池后按等级需求结算） */
+  } else if(k === 'shard'){
+    const d = artiData(); d.stone = Math.min(SAFE_INT, (d.stone || 0) + amt);
+  } else if(k === 'ticket'){
+    S.lmgTicket = Math.min((S.lmgTicket || 0) + amt, SAFE_INT);
+  } else { resAdd('soul', cost); return; }  /* 未知项：不扣费 */
+  S.soulBuy = S.soulBuy || {}; S.soulBuy[k] = (S.soulBuy[k] || 0) + n;
+  logMsg('幽冥魂市：灵魂 -' + nStr(cost) + ' → ' + it.n + ' +' + nStr(amt));
+  toast(it.n + ' +' + nStr(amt) + '（灵魂 -' + nStr(cost) + '）');
+  renderSoulShrine(); renderNow(true); save();
+}
+
+/* ---------- 魂召：灵魂抽取（1.96：仅保留灵兽，法宝抽取已移除）----------
+   灵兽：与灵石抽取共用碎片池，但权重显著更优（神宠 0.5% → 3%），是高品质碎片的主要来源。 */
+const SOUL_DRAW_PET_ONE = 30000, SOUL_DRAW_PET_TEN = 300000;   /* 2.16：4000/40000 → 30000/300000（费用再提高） */
+const SOUL_PET_W = [55, 30, 12, 3];      /* 凡 / 玄 / 仙 / 神（灵石抽为 70/25/4.5/0.5） */
+function soulPetRollKey(){
+  const r = Math.random() * 100; let acc = 0, q = 0;
+  for(let i=0;i<SOUL_PET_W.length;i++){ acc += SOUL_PET_W[i]; if(r < acc){ q = i; break; } q = i; }
+  const list = PETS_LMG.filter(function(x){ return x.q === q; });
+  return list[Math.floor(Math.random() * list.length)].k;
+}
+function soulDrawPet(n){
+  if(!S.lmgUnlocked){ toast('启灵后开启'); return; }
+  const ten = (n === 10);
+  const cost = ten ? SOUL_DRAW_PET_TEN : SOUL_DRAW_PET_ONE;
+  if(!resHas('soul', cost)){ toast('灵魂不足，需 ' + nStr(cost) + ' 灵魂'); return; }
+  S.soul = resHas('soul', cost) ? dsub(resD('soul'), D(cost)) : D(0);
+  const d = petData(), got = {};
+  const cnt = ten ? (10 + PET_TEN_BONUS) : 1;
+  for(let i=0;i<cnt;i++){
+    const k = soulPetRollKey();
+    d.frag[k] = (d.frag[k] || 0) + 1;
+    got[k] = (got[k] || 0) + 1;
+  }
+  S.soulDraw = (S.soulDraw || 0) + cnt;
+  const msg = [];
+  let bestQ = -1;
+  for(const k in got){
+    const df = petDef(k); if(!df) continue;
+    msg.push(df.n + '碎片 ×' + got[k]);
+    if(df.q > bestQ) bestQ = df.q;
+  }
+  toast('魂召获得：' + msg.join('、'));
+  logMsg('幽冥魂召·灵兽 ×' + cnt + '：' + msg.join('、'));
+  if(bestQ >= 2) toast('【' + PET_QN[bestQ] + '】碎片！');
+  renderSoulShrine(); renderLmgPetRow(); renderNow(true); save();
+}
+
+/* 轻量刷新：只改文本与按钮配色，不重建 DOM。
+   render() 由攻击循环驱动（高攻速下每秒数十次），若在 render 里整块 innerHTML 重绘，
+   按钮会被反复销毁重建 —— 玩家点击的瞬间 DOM 可能已被替换，出现「点了没反应」。
+   完整重绘只由玩家操作（购买 / 切页签）触发。 */
+function soulShrineRefresh(){
+  const ov = $('soulOverlay'); if(!ov || !ov.classList.contains('show')) return;
+  const sv = $('soulShrineVal'); if(sv) sv.textContent = dStr(resD('soul'));
+  const bs = $('soulBody'); if(!bs) return;
+  const sD = resD('soul');
+  Array.prototype.forEach.call(bs.querySelectorAll('[data-cost]'), function(e){
+    const c = Number(e.getAttribute('data-cost'));
+    if(c < 0) return;                                  /* -1 = 已满级，保持原样 */
+    const ok = dcmp(sD, D(c)) >= 0;
+    e.classList.toggle('b-purple', ok);
+    e.classList.toggle('b-brown', !ok);
+  });
+}
+/* ---------- 面板 ---------- */
+const SOUL_TABS = [{k:'pact', n:'魂 契'}, {k:'market', n:'魂 市'}, {k:'draw', n:'魂 召'}];
+let soulTab = 'pact';
+function openSoulShrine(){
+  if(!S.lmgUnlocked){ toast('启灵后开启幽冥魂殿'); return; }
+  /* 顺序不能反：renderSoulShrine() 开头有「面板未显示则直接 return」的守卫
+     （render() 每帧会调 soulShrineRefresh，需要这个守卫挡掉关着时的无谓重绘）。
+     若先 render 再 add('show')，首次打开时守卫会把它挡掉 —— 面板弹出来了但里面是空的，
+     必须切一次页签才有内容。先 show 再 render。 */
+  $('soulOverlay').classList.add('show'); renderSoulShrine();
+}
+function closeSoulShrine(){ const o = $('soulOverlay'); if(o) o.classList.remove('show'); }
+function switchSoulTab(t){
+  soulTab = t;
+  const el = $('soulTabs');
+  if(el) Array.prototype.forEach.call(el.children, function(e){ e.classList.toggle('active', e.dataset.c === t); });
+  renderSoulShrine();
+}
+function renderSoulShrine(){
+  const ov = $('soulOverlay'); if(!ov || !ov.classList.contains('show')) return;
+  const sv = $('soulShrineVal'); if(sv) sv.textContent = dStr(resD('soul'));
+  const tb = $('soulTabs');
+  if(tb) tb.innerHTML = SOUL_TABS.map(function(c){
+    return '<div class="sh-tab' + (c.k === soulTab ? ' active' : '') + '" data-c="' + c.k + '" onclick="switchSoulTab(\'' + c.k + '\')">' + c.n + '</div>';
+  }).join('');
+  const body = $('soulBody'); if(!body) return;
+  let h = '';
+  if(soulTab === 'pact'){
+    for(let i=0;i<SOUL_PACTS.length;i++){
+      const d = SOUL_PACTS[i], lv = soulPactLv(d.k), mx = (lv >= SOUL_PACT_MAX);
+      const c = soulPactCost(d.k), can = !mx && resHas('soul', c);
+      const unit = (d.kind === 'exp') ? '%' : (d.kind === 'pct' ? '%' : ' 点');
+      h += '<div class="sl-pact">'
+        +  '<div class="sl-ph"><span class="sl-pn">' + d.n + '</span>'
+        +  '<span class="sl-pl">Lv.' + lv + ' / ' + SOUL_PACT_MAX + '</span></div>'
+        +  '<div class="sl-pd">' + d.d + ' <b>+' + (d.per * lv) + unit + '</b>　每级 +' + d.per + unit + '</div>'
+        +  (!mx && d.kind === 'exp' ? (function(){
+             const p = soulPactPreview(d.k);
+             if(!p) return '';
+             return '<div class="sl-pv">' + d.d + ' ' + dStr(p.now) + ' <b>→ ' + dStr(p.next) + '</b></div>';
+           })() : '')
+        +  '<div class="sl-pb"><div class="fs-btn ' + (can ? 'b-purple' : 'b-brown') + '" data-cost="' + (mx ? -1 : c) + '" onclick="' + (mx ? '' : 'soulPactBuy(\'' + d.k + '\')') + '">'
+        +  '<span>' + (mx ? '已 满 级' : ('升级 ' + nStr(c) + ' 灵魂')) + '</span></div></div>'
+        +  '</div>';
+    }
+  } else if(soulTab === 'market'){
+    for(let i=0;i<SOUL_MARKET.length;i++){
+      const it = SOUL_MARKET[i], amt = soulMarketAmt(it);
+      const _bg = soulMarketBought(it.k);
+      const c1 = soulMarketCost(it, 1, _bg), c10 = soulMarketCost(it, 10, _bg);
+      const b = function(n, c){ return '<div class="fs-btn ' + (resHas('soul', c) ? 'b-purple' : 'b-brown') + '" data-cost="' + c + '" onclick="soulMarketBuy(\'' + it.k + '\',' + n + ')"><span>×' + n + '</span></div>'; };
+      h += '<div class="sl-mk"><div class="sl-mi">'
+        +  '<div class="sl-mn">' + it.n + '　<span style="color:#b98cff;font-size:11.5px">' + nStr(amt) + ' / 份</span></div>'
+        +  '<div class="sl-ms">' + it.d + '　单价 ' + nStr(c1) + ' 灵魂（已换 ' + nStr(_bg) + ' 份，每份 ×' + SOUL_MKT_GROW + '）</div></div>'
+        +  '<div class="sl-mo">' + b(1, c1) + b(10, c10) + '</div></div>';
+    }
+    h += '<div class="sl-hint">单价随<b>兑换份数</b>递增（每份 ×' + SOUL_MKT_GROW + '）；产出随<b>灵界关卡</b>线性放大（第 N 关 = 基准 ×(1+N)）；票券不放大</div>';
+  } else {
+    const lv = Math.max(1, S.lmgLevel || 1);
+    h += '<div class="lmg-card"><h4>魂召 · 灵兽</h4>'
+      +  '<div class="sl-pd">碎片池同灵石，权重更优：<b>凡55 / 玄30 / 仙12 / 神3</b>'
+      +  '</div>'
+      +  '<div class="sl-sum">'
+      +  '<div class="fs-btn ' + (resHas('soul', SOUL_DRAW_PET_ONE) ? 'b-purple' : 'b-brown') + '" data-cost="' + SOUL_DRAW_PET_ONE + '" onclick="soulDrawPet(1)"><span>单抽 ' + nStr(SOUL_DRAW_PET_ONE) + '</span></div>'
+      +  '<div class="fs-btn ' + (resHas('soul', SOUL_DRAW_PET_TEN) ? 'b-purple' : 'b-brown') + '" data-cost="' + SOUL_DRAW_PET_TEN + '" onclick="soulDrawPet(10)"><span>十连 ' + nStr(SOUL_DRAW_PET_TEN) + '</span></div>'
+      +  '</div></div>';
+    h += '<div class="sl-hint">累计魂召 <b>' + nStr(S.soulDraw || 0) + '</b> 次</div>';
+  }
+  body.innerHTML = h;
+  const sm = $('soulSum');
+  if(sm){
+    let tot = 0, maxed = 0;
+    for(let i=0;i<SOUL_PACTS.length;i++){ tot += soulPactLv(SOUL_PACTS[i].k); if(soulPactLv(SOUL_PACTS[i].k) >= SOUL_PACT_MAX) maxed++; }
+    sm.innerHTML = '魂契总等级 <b class="hi">' + tot + '</b> / ' + (SOUL_PACTS.length * SOUL_PACT_MAX)
+      + '　已圆满 <b class="hi">' + maxed + '</b> / ' + SOUL_PACTS.length
+      + '<br><span style="font-size:11px">魂契并入加法池，仅灵界生效　已投入灵魂 ' + nStr(soulPactSpent()) + '</span>';
+  }
+}
+
+/* ---------- 灵界法宝面板 ---------- */
+/* 1.66：法宝 / 符文面板改为「顶部导航分页」，合成独立成一页（不再是全部平铺） */
+let _artiPage = 'equip', _runePage = 'slot';
+const ARTI_PAGES = [{k:'equip',n:'装 备'},{k:'fuse',n:'合 成'},{k:'bag',n:'背 包'}];
+const RUNE_PAGES = [{k:'slot',n:'镶 嵌'},{k:'set',n:'套 装'},{k:'fuse',n:'合 成'},{k:'bag',n:'背 包'}];
+function artiSetPage(k){ _artiPage = k; renderArtiNav(); renderArti(); save(); }
+function runeSetPage(k){ _runePage = k; renderRuneNav(); renderRune(); save(); }
+function _navHtml(list, cur, fn){
+  return list.map(function(p){
+    return '<span class="lmg-nav-i' + (p.k === cur ? ' on' : '') + '" onclick="' + fn + '(\'' + p.k + '\')">' + p.n + '</span>';
+  }).join('');
+}
+function renderArtiNav(){
+  const el = $('artiNav'); if(!el) return;
+  el.innerHTML = _navHtml(ARTI_PAGES, _artiPage, 'artiSetPage');
+  ARTI_PAGES.forEach(function(p){
+    const sec = $('artiSec' + p.k.charAt(0).toUpperCase() + p.k.slice(1));
+    if(sec) sec.style.display = (p.k === _artiPage ? '' : 'none');
+  });
+}
+function renderRuneNav(){
+  const el = $('runeNav'); if(!el) return;
+  el.innerHTML = _navHtml(RUNE_PAGES, _runePage, 'runeSetPage');
+  RUNE_PAGES.forEach(function(p){
+    const sec = $('runeSec' + p.k.charAt(0).toUpperCase() + p.k.slice(1));
+    if(sec) sec.style.display = (p.k === _runePage ? '' : 'none');
+  });
+}
+function openArti(){ if(!S.lmgUnlocked){ toast('启灵后开启'); return; } renderArtiNav(); renderArti(); $('lmgArtiOverlay').classList.add('show'); }
+function closeArti(){ const o = $('lmgArtiOverlay'); if(o) o.classList.remove('show'); }
+let _artiOpen = 0;                                  /* 展开操作的法宝 id */
+function artiToggle(id){ _artiOpen = (_artiOpen === id) ? 0 : id; renderArti(); }
+function renderArti(){
+  const d = artiData();
+  const sEl = $('artiStoneVal'), hEl = $('artiShardVal');
+  if(sEl) sEl.textContent = nStr(S.lmgStone || 0);
+  if(hEl) hEl.textContent = nStr(d.stone || 0);
+  const apb = $('artiPickBox'); if(apb && typeof pickBarHtml === 'function') apb.innerHTML = pickBarHtml('arti');
+  if(typeof renderFuseBox === 'function') renderFuseBox('arti');   /* 1.65：合成内嵌分页 */
+  /* 装备位 */
+  const eg = $('artiEquipGrid');
+  if(eg){
+    let h = '';
+    ARTI_SLOTS.forEach(function(sd){
+      const it = artiEquipped(sd.k);
+      const key = sd.key, val = artiPct(key);
+      if(it){
+        /* 1.81：点击已装备槽位不再「直接卸下」—— 改为弹出操作面板（卸下 / 强化 / 洗练 / 分解）。
+           原实现一次误触就把装备摘了，且与符文槽「点击展开操作」的交互不一致。 */
+        h += '<div class="arti-slot" onclick="artiSlotSheet(\'' + sd.k + '\')" title="点击展开操作">' +
+             '<div class="as-ic" style="color:' + ARTI_QC[it.q] + '">' + artiSvg(sd) + '</div>' +
+             '<div class="as-nm">' + sd.n.replace(/\s/g,'') + '</div>' +
+             '<div class="as-v" style="color:' + ARTI_QC[it.q] + '">' + (it.enh > 0 ? ('+' + it.enh + ' ') : '') +
+             (Math.round(artiItemVal(it, key) * 10) / 10) + (ARTI_PCT_UNIT[key] || '') + '</div></div>';
+      }else{
+        h += '<div class="arti-slot empty" onclick="artiSlotSheet(\'' + sd.k + '\')" title="点击选择装备">' +
+             '<div class="as-ic">' + artiSvg(sd) + '</div>' +
+             '<div class="as-nm">' + sd.n.replace(/\s/g,'') + '</div><div class="as-v">未装备</div></div>';
+      }
+    });
+    eg.innerHTML = h;
+  }
+  /* 加成总览 */
+  const sm = $('artiSum');
+  if(sm){
+    const row = function(n, k){
+      const v = artiPct(k);
+      return v > 0 ? (n + ' +' + (Math.round(v * 10) / 10) + (ARTI_PCT_UNIT[k] || '') + '　') : '';
+    };
+    let t = row('攻击','atk') + row('血量','hp') + row('防御','def') + row('暴伤','cdm') +
+            row('闪避','dodge') + row('穿透','pen') + row('命中','hit') +
+            row('灵力','gp') + row('灵石','gs') + row('灵魂','gu');   /* 1.80：补上新增的头冠（命中） */
+    sm.innerHTML = t ? ('已生效：' + t) : '尚未装备。妖王 / 心魔有概率掉落。';
+  }
+  /* 1.65：合成内嵌在法宝面板里，随面板一起重绘 */
+  if(typeof renderFuseBox === 'function') renderFuseBox('arti');
+  /* 背包 */
+  const bl = $('artiBagList');
+  if(bl){
+    if(!d.bag.length){ bl.innerHTML = '<div class="lmg-sum">背包为空，去「妖 王」获取法宝。</div>'; return; }
+    const bag = d.bag.slice().sort(function(a, b){ return (b.q - a.q) || (b.main - a.main); });
+    let h = '';
+    bag.forEach(function(it){
+      const sd = artiSlotDef(it.slot);
+      const on = d.equip[it.slot] === it.id;
+      const open = (_artiOpen === it.id);
+      let aff = '';
+      (it.aff || []).forEach(function(a){
+        aff += '<span style="margin-right:8px">' + (ARTI_AFF_NAME[a.k] || a.k) + ' +' + a.v + (ARTI_PCT_UNIT[a.k] || '') + '</span>';
+      });
+      h += '<div class="arti-item">' +
+           '<div class="arti-hd" onclick="artiToggle(' + it.id + ')">' +
+           '<span class="an" style="color:' + ARTI_QC[it.q] + '">' + (it.enh > 0 ? ('+' + it.enh + ' ') : '') + artiName(it) + '</span>' +
+           '<span class="aq" style="color:' + ARTI_QC[it.q] + '">' + (on ? '已装备' : (sd ? sd.n.replace(/\s/g,'') : '')) + '</span></div>' +
+           '<div class="arti-line">主属性：' + (ARTI_AFF_NAME[sd ? sd.key : 'atk'] || '') + ' +' +
+             (Math.round(it.main * (1 + (it.enh || 0) * ARTI_ENH_STEP) * 10) / 10) + (ARTI_PCT_UNIT[sd ? sd.key : 'atk'] || '') + '</div>' +
+           (aff ? '<div class="arti-line">' + aff + '</div>' : '') +
+           (open ?
+             '<div class="arti-ops">' +
+             (on ? '<div class="fs-btn b-brown" onclick="artiUnequip(\'' + it.slot + '\')"><span>卸 下</span></div>'
+                 : '<div class="fs-btn b-gold" onclick="artiEquip(' + it.id + ')"><span>装 备</span></div>') +
+             '<div class="fs-btn b-gold" onclick="artiEnh(' + it.id + ')"><span>强化 ' + nStr(artiEnhCost(it)) + '</span></div>' +
+             '<div class="fs-btn b-blue" onclick="artiReroll(' + it.id + ')"><span>洗练 ' + artiRerollCost(it) + '</span></div>' +
+             '<div class="fs-btn b-brown" onclick="artiMelt(' + it.id + ')"><span>分 解</span></div>' +
+             '</div>' : '') +
+           '</div>';
+    });
+    bl.innerHTML = h;
+  }
+}
+/* ---------- 凡人界分身面板 ---------- */
+function openFrClone(){ renderFrClone(); $('frCloneOverlay').classList.add('show'); }
+function closeFrClone(){ const o = $('frCloneOverlay'); if(o) o.classList.remove('show'); }
+/* 1.56：分身自动化 —— 自动推关 / 自动转生，两个开关只作用于凡人界。
+   分身本身只在「主角在灵界」时运转，故这两个开关等价于「委托分身打理凡人界」。 */
+function cloneAutoNextOn(){ return S.cloneAutoNext === true; }
+function cloneAutoRbOn(){ return S.cloneAutoRb === true; }
+function toggleCloneAutoNext(){
+  if(!frCloneUnlocked()){ toast('分身未解锁'); return; }
+  S.cloneAutoNext = !cloneAutoNextOn();
+  toast('分身自动推关：' + (S.cloneAutoNext ? '开' : '关'));
+  logMsg('分身自动推关 → ' + (S.cloneAutoNext ? '开' : '关'));
+  /* 立即执行一次：tick 每 5 分钟才跑，若只在 tick 里做，玩家开了开关要干等 5 分钟才见动静，
+     极易误判为「没生效」。开启时立刻跑一遍，关开关时无需执行。 */
+  if(S.cloneAutoNext) cloneAutoStep();
+  renderFrClone(); save();
+}
+function toggleCloneAutoRb(){
+  if(!frCloneUnlocked()){ toast('分身未解锁'); return; }
+  S.cloneAutoRb = !cloneAutoRbOn();
+  toast('分身自动转生：' + (S.cloneAutoRb ? '开（推到极限才转）' : '关'));
+  logMsg('分身自动转生 → ' + (S.cloneAutoRb ? '开' : '关'));
+  if(S.cloneAutoRb) cloneAutoStep();                    /* 同上：开启即生效，不等 5 分钟 tick */
+  renderFrClone(); save();
+}
+/* 分身后台转生：只做数值结算。
+   不能复用 doRebirth() —— 它开头就调 exitLingToFr()「转生属凡人界行为，先返回凡人界」，
+   分身本就是为了「主角留在灵界、凡人界不停摆」，一转生就把玩家踢出灵界，与设计完全相悖。 */
+function cloneDoRebirth(){
+  const need = rebirthNeed();
+  if((S.level || 1) < need) return false;
+  const gain = rebirthGain();
+  S.pts = dadd(S.pts || D(0), gain);
+  S.rebirth = (S.rebirth || 0) + 1;
+  if(typeof questAdd === 'function') questAdd('rb', 1);
+  resAdd('tstone', 1);                   /* 与 doRebirth 同口径：每次转生 1 枚天赋石 */
+  S.level = 1;
+  S.poison = 0; S.ndxStack = 0;
+  logMsg('分身代为转生：+' + dStr(gain) + ' 转生币，凡人界回归第 1 关（下次需第 ' + rebirthNeed() + ' 关）');
+  if(typeof renderNow === 'function') renderNow(true);
+  save();
+  return true;
+}
+/* 分身每 tick 时执行凡人界自动化：先推关，达标再转生 */
+function cloneAutoStep(){
+  if(!frCloneUnlocked()) return;
+  if(cloneTargetSecret()) return;              /* 1.56：挂机目标为秘境时，不再代管凡人界关卡 */
+  if(!cloneAutoNextOn() && !cloneAutoRbOn()) return;
+  /* 分身在凡人界代练，因此这里操控的是凡人界关卡 —— 与灵界无关 */
+  if(cloneAutoNextOn()){
+    const before = S.level || 1;
+    /* 与离线推关同一口径：速率按历史最高关比例算，上限 stLv。
+       传 byClone=true，否则「主角在灵界」的判断会让分身永远空转。 */
+    const r = offlineFrPush(FR_CLONE_TICK_SEC / 3600, true);
+    if(r && (S.level || 1) > before){ logMsg('分身推进凡人界：第 ' + r.from + ' 关 → 第 ' + r.to + ' 关'); }
+  }
+  if(cloneAutoRbOn()){
+    const need = rebirthNeed();
+    if((S.level || 1) >= need && cloneDoRebirth()){ toast('分身代为转生（第 ' + need + ' 关）'); }
+  }
+}
+/* 1.56：击杀数格式化。原先一律 Math.floor()，极小值（如 1.94e-55）直接显示 0，
+   玩家看到「击杀 0/时」会以为分身没生效，实际是【当前关卡怪物太硬、打不动】。 */
+function fmtKPH(k){
+  if(!(k > 0)) return '<span style="color:#c98a8a">0（打不动）</span>';
+  if(k >= 1) return nStr(Math.floor(k));
+  return '<span style="color:#c98a8a">' + k.toExponential(1) + '</span>';
+}
+function renderFrClone(){
+  const st = $('cloneState');
+  const ok = frCloneUnlocked();
+  if(st){
+    st.innerHTML = ok
+      ? ('状态 <b>运转中</b>（主角在灵界）' )
+      : ('未解锁　需 <b>' + FR_CLONE_NEED_REB + ' 次转生 + 启灵</b>（当前 ' + nStr(S.rebirth || 0) + ' 转）');
+  }
+  const g = $('cloneGrid');
+  if(g){
+    if(!ok){
+      g.innerHTML = '<div class="lmg-kv"><span>状态</span><b>未解锁</b></div>';
+    }else if(cloneTargetSecret()){
+      /* 1.56：挂机目标 = 秘境 —— 显示秘境产出预估 */
+      const c = frCloneSecretGainPH();
+      if(!c){
+        g.innerHTML = '<div class="lmg-kv"><span>状态</span><b>秘境当前层打不动</b></div>';
+      }else{
+        g.innerHTML =
+          '<div class="lmg-kv"><span>秘境层数</span><b class="hi">第 ' + nStr(c.stage) + ' 关</b></div>' +
+          '<div class="lmg-kv"><span>击杀</span><b class="hi">' + fmtKPH(c.kills) + '/时</b></div>' +
+          '<div class="lmg-kv"><span>内力</span><b class="hi">+' + dStr(c.neili) + '</b></div>' +
+          '<div class="lmg-kv"><span>灵魂</span><b class="hi">+' + nStr(Math.floor(c.soul)) + '</b></div>' +
+          '<div class="lmg-kv"><span>凡尘宝箱</span><b class="hi">+' + (Math.round(c.box * 100) / 100) + '</b></div>' +
+          '<div class="lmg-kv"><span>化肥</span><b class="hi">' + (Math.round(c.fert * 1000) / 1000) + '/时</b></div>' +
+          '<div class="lmg-kv"><span>种子</span><b class="hi">' + (Math.round(c.seed * 1000) / 1000) + '/时</b></div>';
+      }
+    }else{
+      const c = frCloneGainPH();
+      if(!c){
+        g.innerHTML = '<div class="lmg-kv"><span>状态</span><b>暂无产出</b></div>';
+      }else{
+        g.innerHTML =
+          '<div class="lmg-kv"><span>击杀</span><b class="hi">' + fmtKPH(c.kills) + '/时</b></div>' +
+          '<div class="lmg-kv"><span>宝石</span><b class="hi">+' + nStr(Math.floor(c.gem)) + '</b></div>' +
+          '<div class="lmg-kv"><span>内力</span><b class="hi">+' + dStr(c.neili) + '</b></div>' +
+          '<div class="lmg-kv"><span>灵魂</span><b class="hi">+' + nStr(Math.floor(c.soul)) + '</b></div>' +
+          '<div class="lmg-kv"><span>凡尘宝箱</span><b class="hi">+' + (Math.round(c.box * 100) / 100) + '</b></div>';
+      }
+    }
+  }
+  /* 1.56：自动化开关状态 */
+  const ac = $('cloneAutoCard'); if(ac) ac.style.display = ok ? '' : 'none';
+  /* 1.56：挂机目标 —— 两块独立按钮互斥单选，选中高亮、未选中灰掉。
+     单按钮切换的旧实现无法表达「当前选了哪个 / 只能选一个」，玩家据此判定分身没生效。 */
+  const tgc = $('cloneTargetCard'); if(tgc) tgc.style.display = ok ? '' : 'none';
+  const bl = $('cloneTgLvBtn'), bs = $('cloneTgSecBtn');
+  const sec = cloneTargetSecret();
+  if(bl){
+    bl.textContent = '凡人界关卡';
+    bl.className = 'gbtn ' + (sec ? 'off' : 'on');
+    bl.style.opacity = sec ? '0.45' : '';
+  }
+  if(bs){
+    bs.textContent = '秘境';
+    bs.className = 'gbtn ' + (sec ? 'on' : 'off');
+    bs.style.opacity = sec ? '' : '0.45';
+  }
+  const tgt = $('cloneTgTip');
+  if(tgt){
+    tgt.innerHTML = sec
+      ? '当前：<b class="hi">秘境</b>　（选「凡人界关卡」可切回推关 / 转生）'
+      : '当前：<b class="hi">凡人界关卡</b>　（选「秘境」改为逐层刷秘境）';
+  }
+  /* 秘境模式下推关 / 转生按钮对秘境完全无效 —— 旧实现只是加 opacity 置灰，
+     按钮仍在且状态照旧显示「开」，玩家据此以为分身不听使唤。
+     现改为按挂机目标整行替换：秘境只留「自动重置」，不再出现无效开关。 */
+  const _secMode = ok && cloneTargetSecret();
+  const _lvRow = $('cloneLvAutoRow'), _secRow = $('cloneSecAutoRow');
+  if(_lvRow) _lvRow.style.display = _secMode ? 'none' : '';
+  if(_secRow) _secRow.style.display = _secMode ? '' : 'none';
+  const cs = $('cloneAutoSub');
+  if(cs) cs.textContent = _secMode ? '秘境：打不动时如何处理' : '凡人界：推关与转生';
+  const cn = $('cloneAutoNextBtn');
+  if(cn){
+    cn.textContent = '自动推关：' + (cloneAutoNextOn() ? '开' : '关');
+    cn.className = 'gbtn ' + (cloneAutoNextOn() ? 'on' : 'off');
+  }
+  const cr = $('cloneAutoRbBtn');
+  if(cr){
+    cr.textContent = '自动转生：' + (cloneAutoRbOn() ? '开' : '关');
+    cr.className = 'gbtn ' + (cloneAutoRbOn() ? 'on' : 'off');
+  }
+  /* 秘境段：与主界面秘境信息条共用 S.secAutoReset / S.secResetSec，两边状态一致 */
+  if(_secMode){
+    const cb = $('cloneSecAutoBtn'), ci = $('cloneSecAutoSec');
+    const ul = secAutoUnlocked(), on = secAutoOn();
+    if(cb){
+      cb.textContent = ul ? ('自动重置：' + (on ? '开' : '关')) : '自动重置：未解锁';
+      cb.classList.toggle('on', !!on);
+      cb.style.opacity = ul ? '' : '.55';
+    }
+    if(ci){
+      ci.style.display = ul ? '' : 'none';
+      if(document.activeElement !== ci && String(ci.value) !== String(secAutoSec())) ci.value = secAutoSec();
+    }
+  }
+  const ct = $('cloneAutoTip');
+  if(ct){
+    if(_secMode){
+      const _c = frCloneSecretGainPH();
+      const _aps = (typeof secApsMul === 'function') ? secApsMul().toFixed(2) : '1.00';
+      ct.innerHTML = '分身<b>秘境</b>中，产出内力 / 灵魂 / 宝箱 / 化肥 / 种子，' +
+        '与手动<b>同口径</b>，享攻速加成（×' + _aps + '）。<br>' +
+        '<span style="color:#9a8f78">击杀即进下一层，推到打不动为止</span>' +
+        (secAutoOn()
+          ? '<br><span style="color:#9a8f78">打不动后按设定秒数<b>自动重置</b></span>'
+          : (!secAutoUnlocked()
+              ? '<br><span style="color:#c98a8a">未解锁：需宝物「轮回秘境印」</span>'
+              : '<br><span style="color:#c98a8a">已关闭：打不动会<b>卡住</b>，产出归零</span>')) +
+        (!_c ? '<br><span style="color:#c98a8a">当前层打不动，产出为 0。</span>' : '');
+    }else{
+    let need = Infinity;
+    try{ need = rebirthNeed(); }catch(e){ need = Infinity; }
+    const cap = Math.min(Math.max(1, S.stLv || 1), isFinite(need) ? need : Math.max(1, S.stLv || 1));
+    const k = (typeof frCloneKillsPH === 'function') ? frCloneKillsPH() : 0;
+    ct.innerHTML = '<b>仅凡人界生效</b>：分身代推关、自动转生<br>' +
+      '当前第 <b>' + nStr(S.level || 1) + '</b> 关　转生线 <b>' + (isFinite(need) ? need : '-') + '</b> 关' +
+      '<br><span style="color:#9a8f78">上限取「历史最高 / 转生线」孰低（第 ' + cap + ' 关）——' +
+      '推过头会打不动，产出归零</span>' +
+      (!(k > 1) ? '<br><span style="color:#c98a8a">怪物过强，关掉自动推关可让关卡回落</span>' : '');
+    }
+  }
+  const sm = $('cloneSum');
+  if(sm){
+    if(ok){
+      sm.innerHTML = (S.realm === 'lmg')
+        ? '分身正在凡人界代为历练。'
+        : '<b class="hi">分身暂不产出</b>，去灵界后自动恢复';
+    }else{
+      sm.innerHTML = '分身属后期内容，需 ' + FR_CLONE_NEED_REB + ' 次转生并启灵后开启。';
+    }
+  }
+}
+
+/* ---------- 训练洞府面板 ---------- */
+function openCave(){ if(!S.lmgUnlocked){ toast('启灵后开启'); return; } renderCave(); $('lmgCaveOverlay').classList.add('show'); }
+function closeCave(){ const o = $('lmgCaveOverlay'); if(o) o.classList.remove('show'); }
+function renderCaveTop(){
+  const d = caveData(), jv = $('caveJadeVal'), tv = $('caveTotalVal');
+  if(jv) jv.textContent = nStr(d.jade || 0);
+  if(tv) tv.textContent = nStr(caveTotalLv());
+}
+function renderCave(){
+  renderCaveTop();
+  const d = caveData();
+  const top = $('caveTop');
+  if(top){
+    const g = caveGainPH();
+    const parts = CAVE_LINES.filter(function(l){ return l.k !== 'jade'; }).map(function(l){
+      return l.n + ' ' + nStr(g[l.k] * 1) + l.unit;
+    });
+    parts.unshift('灵玉产线 ' + nStr(caveLinePH('jade')) + '/时');
+    top.innerHTML = '每小时产出：' + parts.join('　') + '<br>灵玉 ' + (Math.round(g.jade * 100) / 100) + '/时（总等级 ' + caveTotalLv() + '）';
+  }
+  const box = $('caveLineList');
+  if(!box) return;
+  let h = stepBar('cave', renderCave, '点一次按此档位升级');
+  CAVE_LINES.forEach(function(l){
+    const lv = caveLv(l.k), c = caveUpCost(l.k), poor = (d.jade || 0) < c;
+    const ph = caveLinePH(l.k);
+    const nextPh = (lv + 1) * l.base;
+    h += '<div class="cave-item' + (poor ? ' poor' : '') + '">' +
+         '<div class="ci-hd"><span class="ci-n"><i style="font-style:normal;color:#d4af37">' + l.ic + '</i> ' + l.n + '</span>' +
+         '<span class="ci-lv">Lv.' + lv + '</span></div>' +
+         '<div class="ci-line">产出 <b>' + nStr(ph) + l.unit + '</b>' + (lv > 0 ? '　（升级后 ' + nStr(nextPh) + l.unit + '）' : '') + '</div>' +
+         '<div class="ci-ops"><div class="fs-btn ' + (poor ? 'b-gray' : 'b-gold') + '" onclick="caveUpN(\'' + l.k + '\',' + (stepIsMax('cave') ? '0' : 'stepN(\'cave\')') + ')"><span>升级 ' + stepTxt('cave') + ' · ' + nStr(c) + ' 灵玉</span></div></div>' +
+         '</div>';
+  });
+  box.innerHTML = h;
+}
+
+/* ---------- 灵界选关 ---------- */
+function openLmgPick(){
+  if(!S.lmgUnlocked){ toast('启灵后开启'); return; }
+  renderLmgPick(); $('lmgPickOverlay').classList.add('show');
+}
+function closeLmgPick(){ const o = $('lmgPickOverlay'); if(o) o.classList.remove('show'); }
+function lmgPrevBossLv(){
+  const lv = S.lmgLevel || 1;
+  const p = Math.floor((lv - 1) / LMG_BOSS_EVERY) * LMG_BOSS_EVERY;
+  return Math.max(1, p || 1);
+}
+function lmgGoLv(n){
+  n = Math.floor(Number(n) || 0);
+  const max = Math.max(1, S.lmgMaxLv || 1);
+  if(n < 1) n = 1;
+  if(n > max){ toast('尚未通关该层（当前最高 第 ' + max + ' 关）'); return; }
+  if(lmgInTrial()){ toast('请先退出心魔试炼'); return; }
+  S.lmgLevel = n;
+  lmgNewMon();
+  S.lmgHp = lmgAttrD('hp');
+  resetFloatBuf(); startLmgMon();
+  toast('跳转至 第 ' + n + ' 关');
+  logMsg('灵界选关：跳转至第 ' + n + ' 关');
+  renderLmgCtrl(); renderNow(true); save();
+}
+function renderLmgPick(){
+  const mx = $('pickMaxLv'), cu = $('pickCurLv'), ti = $('pickTip');
+  const max = Math.max(1, S.lmgMaxLv || 1);
+  if(mx) mx.textContent = nStr(max);
+  if(cu) cu.textContent = nStr(S.lmgLevel || 1);
+  const inp = $('pickInput'); if(inp){ inp.max = max; if(!inp.value) inp.value = '1'; }
+  if(ti){
+    const cur = S.lmgLevel || 1;
+    ti.innerHTML = '可跳转范围：第 1 关 ~ 第 <b class="hi">' + nStr(max) + '</b> 关（当前第 ' + nStr(cur) + ' 关）'
+      + '<br>妖王层：每 ' + LMG_BOSS_EVERY + ' 关一只（第 ' + nStr(lmgNextBossLv()) + ' 关是下一只）';
+  }
+}
+/* ==================== 凡人界分身 ====================
+   解锁：100 次转生 + 已启灵（与启灵同一道门槛，属后期内容）。
+   规则：只有主角在灵界时才产出；主角回到凡人界打怪则完全不产出 ——
+        分身的意义是「去灵界后凡人界不至于停摆」，而不是让人挂着分身白嫖。
+   产出：按凡人界当前关卡的击杀效率估算（DPS 与攻速 → 每小时击杀数），
+        再乘以自己打怪的每击杀产出，最后统一打 FR_CLONE_RATE 的折扣 ——
+        刻意低于自己亲手刷，亲自打永远更划算。
+   无离线：分身只在在线 tick 中结算，不参与离线时长计算。 */
+const FR_CLONE_RATE     = 0.35;      /* 分身效率：自己打怪的 35% */
+const FR_CLONE_NEED_REB = 100;       /* 解锁所需转生次数 */
+const FR_CLONE_TICK_SEC = 300;       /* 每 5 分钟结算一次 */
+function frCloneUnlocked(){ return (S.rebirth || 0) >= FR_CLONE_NEED_REB && !!S.lmgUnlocked; }
+/* 每小时击杀数：与灵界离线同口径（DPS / 怪物血量），但用凡人界的 calcDps + 当前关血量 */
+function frCloneKillsPH(){
+  try{
+    const dps = calcDps();
+    if(!dps || dcmp(dps, D(0)) <= 0) return 0;
+    const hp = dmul(BASE_HP, dpow(BASE_GROW, Math.max(0, (S.level || 1) - 1)));
+    const ld = Math.log10(Math.abs(dps.m || 0)) + Number(dps.e || 0n);
+    const lh = Math.log10(Math.abs(hp.m || 0)) + Number(hp.e || 0n);
+    const sec = Math.pow(10, lh - ld);
+    if(!isFinite(sec) || sec <= 0) return 0;
+    const aps = realAps();
+    let k = 3600 / sec;
+    if(!isFinite(k)) return 0;
+    /* 1.56：接入香火「疾神·多杀」。
+       单次攻击伤害 = DPS / 攻速，打穿当前怪后溢出伤害继续连斩（与主线 killBoss 同口径），
+       故每次攻击最多斩 floor(DPS / (攻速 × 血量)) 只，再受疾神上限 multiKillCap() 约束。
+       击杀/时 = 攻速 × 3600 × 每次攻击斩杀数，且不会超过理论上限 3600/sec（DPS ÷ 血量）。
+       注：只有「伤害溢出」才触发多杀 —— 关卡高到打不动时仍为 1 只，多杀救不了，
+       真正的解法是到转生线就转生（推关上限已卡在转生线）。 */
+    let per = 1;
+    if(aps > 0){
+      const dmgPerHit = Math.pow(10, ld - Math.log10(aps));   /* 单次攻击伤害 */
+      per = Math.max(1, Math.floor(dmgPerHit / Math.pow(10, lh)));
+    }
+    const cap = (typeof multiKillCap === 'function') ? multiKillCap() : 1;
+    per = Math.min(cap, per);
+    if(aps > 0) k = Math.min(k, aps * 3600 * per);    /* 攻速 × 多杀，且不超理论上限 */
+    return Math.max(0, k) * FR_CLONE_RATE;
+  }catch(e){ return 0; }
+}
+/* 给定 DPS 与怪物血量，返回「击杀/时」（含多杀上限与分身效率系数）。
+   抽出为公共函数：凡人界关卡与秘境只是血量公式不同，效率算法完全一致。 */
+function _cloneKphFor(dps, hp){
+  const ld = Math.log10(Math.abs(dps.m || 0)) + Number(dps.e || 0n);
+  const lh = Math.log10(Math.abs(hp.m || 0)) + Number(hp.e || 0n);
+  const sec = Math.pow(10, lh - ld);
+  if(!isFinite(sec) || sec <= 0) return 0;
+  const aps = realAps();
+  let k = 3600 / sec;
+  if(!isFinite(k)) return 0;
+  let per = 1;
+  if(aps > 0){
+    const dmgPerHit = Math.pow(10, ld - Math.log10(aps));
+    per = Math.max(1, Math.floor(dmgPerHit / Math.pow(10, lh)));
+  }
+  const cap = (typeof multiKillCap === 'function') ? multiKillCap() : 1;
+  per = Math.min(cap, per);
+  if(aps > 0) k = Math.min(k, aps * 3600 * per);
+  return Math.max(0, k) * FR_CLONE_RATE;
+}
+/* 分身在秘境的击杀效率（按当前秘境层数怪物血量） */
+function frCloneSecretKillsPH(){
+  try{
+    const dps = calcDps();
+    if(!dps || dcmp(dps, D(0)) <= 0) return 0;
+    return _cloneKphFor(dps, secretMaxHpFor(Math.max(1, S.secretStage || 1)));
+  }catch(e){ return 0; }
+}
+/* ── 1.91 内力加成：统一加法池，攻速单独乘 ──────────────────────────────
+   原结构被拆成 4 个乘区（攻速 × 经脉矿脉 × BOSS × 加成池），区相乘：
+   堆多个来源的实际收益是乘积而非加和，玩家看到 +200% 与 +600% 会以为相加，
+   实测全额投入时 ×539（若真为单一加法池仅 ×15），内力因此膨胀失控。
+   现合并：经脉 / 矿脉 / BOSS / 功法 / 遗物 / 宠物 / 宝物 / 称号 / 兵器 全部进同一加法池，
+   只有攻速保留独立乘区（保留「堆攻速在秘境有额外回报」的设计意图）。
+   口径与手动 secretKill 完全一致。 */
+function secNeiliAddPct(){
+  return merSum('neili') + maiFrDropPct('neili')          /* 足三阴经 + 矿脉 */
+       + bossNeiliPct()                                    /* BOSS 通关 */
+       + gfSum('neili') + relicVal('neili') + petSum('neili')
+       + treSum('neili') + titleSum('neili') + weapNeili(); /* 功法/遗物/宠物/宝物/称号/兵器 */
+}
+function secretNeiliMul(){ return 1 + secNeiliAddPct() / 100; }
+/* 秘境挂机产出预估（每小时） */
+function frCloneSecretGainPH(){
+  /* 2.15：与真实分身节奏对齐 —— 每秒一 tick、每 tick 最多推进 1 只（minSecPerKill = 1），
+     且怪物血量逐层递增；原实现按当前层速率整段外推，高估数十倍。 */
+  return secSimHour(1, {rate: FR_CLONE_RATE, minSecPerKill: 1});
+}
+/* 分身秘境挂机：逐层模拟推进，产出与手动秘境同口径（含攻速加成）。
+   秘境机制是「击杀 → 进下一层」，故分身会一路推到打不动为止，
+   之后停在该层；若玩家开启了秘境自动重置，则由分身代为重置。 */
+function cloneSecretStep(hrs){
+  if(!frCloneUnlocked()) return null;
+  if(S.realm !== 'lmg') return null;
+  /* 玩家自己正在秘境里：分身不插手。
+     否则分身推进 secretStage 会与手动 secretKill 抢同一份层数 / 血量，
+     玩家刚打掉一半血的怪会被 secretInit() 换掉，表现为「血条莫名满血」。 */
+  if(S.inSecret) return null;
+  if(!(hrs > 0)) return null;
+  let dps;
+  try{ dps = calcDps(); }catch(e){ return null; }
+  if(!dps || dcmp(dps, D(0)) <= 0) return null;
+  const apsMul = secApsMul();
+  const nlMul = secretNeiliMul();
+  const startStage = Math.max(1, S.secretStage || 1);
+  let stage = startStage;
+  let kills = 0, nlSum = D(0), boxN = 0, soulN = 0;
+  /* 每次 tick 最多推进 1 层，节奏与手动一致（最快一秒一层）。
+     原实现把本次时间预算一次性算完：DPS 高时一个 tick 就连推几十层，
+     层数飞涨、掉落日志刷屏，观感上完全不像「分身在代打」。
+     改为用累积器攒够击杀所需时长才进一层，剩余时长留到下次 tick。 */
+  _secCloneAcc = (_secCloneAcc || 0) + hrs;
+  {
+    const kph = _cloneKphFor(dps, secretMaxHpFor(stage));
+    if(kph > 0){
+      const need = 1 / kph;                       /* 杀掉当前层所需小时数 */
+      if(_secCloneAcc >= need){
+        _secCloneAcc -= need;
+        kills += 1;
+        let nl = secNeiliBase(stage);            /* 1.90：含重复层衰减 */
+        nlSum = dadd(nlSum, dFloor(dmul(D(nl), D(apsMul * nlMul))));
+        secMarkBest(stage);                      /* 1.90：分身推进也计入已击杀最高层 */
+        soulN += 1;
+        if(Math.random() < Math.min(0.95, SEC_BOX_BASE * apsMul)) boxN += 1;
+        stage += 1;
+      }
+    }
+  }
+  if(kills <= 0){
+    /* 完全打不动：仅在玩家开启了「秘境自动重置」时才代为重置，
+       且冷却与玩家设定的秒数一致 —— 否则 clonePushTick 每秒一跑会每秒重置一次，
+       日志刷屏且秘境层数永远卡在 1。 */
+    if(secAutoOn()){
+      const _now = Date.now(), _cd = secAutoSec() * 1000;
+      if(!S.secCloneTs) S.secCloneTs = _now;                 /* 首次打不动：开始计时 */
+      if(_now - S.secCloneTs >= _cd){
+        S.secCloneTs = _now;
+        resetSecret();
+        logMsg('分身打不动，已自动重置');
+      }
+    }else{ S.secCloneTs = 0; }
+    return null;
+  }
+  S.secCloneTs = 0;                                        /* 有击杀则清掉打不动计时 */
+  S.secretStage = stage;
+  S.secretKills = (S.secretKills || 0) + kills;
+  S.stSecK = (S.stSecK || 0) + kills;
+  if(dcmp(nlSum, D(0)) > 0)  S.neili = dadd(nlD(), nlSum);
+  if(soulN > 0)  resAdd('soul', soulGain(soulN));
+  if(boxN  > 0)  resAdd('box', boxN);
+  /* 化肥 / 种子：期望值取整，零头进累加器，避免小数被抹 */
+  const d = frCloneData();
+  let fertRaw = (d.accFert || 0) + kills * FERT_DROP_BASE * apsMul;
+  let fn = Math.floor(fertRaw); d.accFert = fertRaw - fn;
+  for(let i = 0; i < Math.min(fn, 20); i++){
+    const _f = fertRndOne(); fertAdd(_f.k, 1);
+    logMsg('分身秘境掉落【' + _f.n + '】×1');
+  }
+  let seedRaw = (d.accSeed || 0) + kills * SEED_DROP_BASE * apsMul;
+  let sn = Math.floor(seedRaw); d.accSeed = seedRaw - sn;
+  for(let i = 0; i < Math.min(sn, 20); i++){
+    const _si = seedRndOne(); seedAdd(_si, 1);
+    logMsg('分身秘境掉落种子【' + SEEDS[_si].n + '】×1');
+  }
+  return {kills:kills, from:startStage, to:stage, neili:nlSum, soul:soulN, box:boxN};
+}
+/* 挂机目标：'level' 凡人界关卡（默认） / 'secret' 秘境 */
+function cloneTarget(){ return (S.cloneTarget === 'secret') ? 'secret' : 'level'; }
+function cloneTargetSecret(){ return cloneTarget() === 'secret'; }
+/* 挂机目标：两个独立入口互斥单选。
+   原实现是「一个按钮来回切」，玩家看不出当前挂在哪个、也不知道只能选一个，
+   实际效果与「分身没生效」无异 —— 改为两块分开的按钮，选中态高亮，未选中的灰掉。 */
+function setCloneTarget(t){
+  if(!frCloneUnlocked()){ toast('分身未解锁（需 ' + FR_CLONE_NEED_REB + ' 次转生 + 启灵）'); return; }
+  const v = (t === 'secret') ? 'secret' : 'level';
+  if(cloneTarget() === v){ renderFrClone(); return; }
+  S.cloneTarget = v;
+  const txt = v === 'secret' ? '秘境' : '凡人界关卡';
+  toast('分身挂机目标：' + txt);
+  logMsg('分身挂机目标 → ' + txt);
+  if(v === 'secret') cloneSecretStep(FR_CLONE_TICK_SEC / 3600);   /* 切过去立刻跑一次，别让玩家干等 */
+  renderFrClone(); save();
+}
+/* 兼容旧存档 / 旧调用点：无参切换 */
+function toggleCloneTarget(){ setCloneTarget(cloneTargetSecret() ? 'level' : 'secret'); }
+function frCloneGainPH(){
+  const k = frCloneKillsPH();
+  if(!(k > 0)) return null;
+  const lv = S.level || 1;
+  return {
+    kills: k,
+    soul: k * 1,                                  /* 每击杀 1 灵魂 */
+    box:  k * 0.22,                               /* 宝箱掉落 22% */
+    gem:  k * 0.22 * 12,                          /* 宝箱平均约 12 宝石 */
+    neili: k * (10 + lv * 1.2)                    /* 与关卡挂钩的内力基准 */
+  };
+}
+function frCloneApply(hrs){
+  if(!frCloneUnlocked()) return null;
+  if(S.realm !== 'lmg') return null;              /* 只有主角在灵界才产出 */
+  if(!(hrs > 0)) return null;
+  const g = frCloneGainPH();
+  if(!g) return null;
+  const d = frCloneData();
+  const r = {soul:0, box:0, gem:0, neili:0};
+  /* 宝石 / 内力：整数累加，零头进 acc 防止小数被抹 */
+  let gemRaw = (d.accGem || 0) + g.gem * hrs;
+  r.gem = Math.floor(gemRaw); d.accGem = gemRaw - r.gem;
+  let nlRaw = (d.accNl || 0) + g.neili * hrs;
+  r.neili = Math.floor(nlRaw); d.accNl = nlRaw - r.neili;
+  let boxRaw = (d.accBox || 0) + g.box * hrs;
+  r.box = Math.floor(boxRaw); d.accBox = boxRaw - r.box;
+  let soulRaw = (d.accSoul || 0) + g.soul * hrs;
+  r.soul = Math.floor(soulRaw); d.accSoul = soulRaw - r.soul;
+  if(r.gem > 0)   resAdd('gem', r.gem);
+  if(r.neili > 0) nlAdd(r.neili);
+  if(r.box > 0){  resAdd('box', r.box); }
+  if(r.soul > 0)  resAdd('soul', soulGain(r.soul));
+  return r;
+}
+function frCloneData(){
+  if(!S.frClone) S.frClone = {accGem:0, accNl:0, accBox:0, accSoul:0, accFert:0, accSeed:0, total:{}};
+  const d = S.frClone;
+  if(!d.total) d.total = {};
+  if(typeof d.accFert !== 'number') d.accFert = 0;
+  if(typeof d.accSeed !== 'number') d.accSeed = 0;
+  return d;
+}
+/* 按权重强制抽一档（发放已累积的掉落数时用；与 fertRollDrop 的「先判概率」不同） */
+function fertRndOne(){
+  let tot = 0; FERT_W.forEach(function(x){ tot += x; });
+  let r = Math.random() * tot;
+  for(let i = 0; i < FERT.length; i++){ r -= FERT_W[i]; if(r <= 0) return FERT[i]; }
+  return FERT[0];
+}
+function seedRndOne(){
+  let tot = 0; SEED_W.forEach(function(x){ tot += x; });
+  let r = Math.random() * tot;
+  for(let i = 0; i < SEEDS.length; i++){ r -= SEED_W[i]; if(r <= 0) return i; }
+  return 0;
+}
+/* 每秒至少推进的关数。比例推进在剩余量小时会算出 0，靠此值兜底。
+   默认 1：从 1 关推到转生线约需 33 分钟（转生线越高越久），想加快就调大这个数。 */
+const CLONE_PUSH_MIN_STEP = 1;
+/* 1.56：分身平滑推关。
+   原实现只在 5 分钟的 frCloneTick 里推一次：中间关卡数字纹丝不动，
+   玩家看着「分身在运转」却不见关卡涨，极易判定为没生效。
+   改为每秒推进一点点，关卡数字持续上涨，符合「分身正在代打」的直觉。
+   用累积器 _clonePushAcc 存小数，避免每秒的微小增量被 floor 抹掉。 */
+let _clonePushAcc = 0, _clonePushTimer = null;
+/* 秘境推进累积器（小时）：攒够击杀当前层所需时长才进一层，剩余留到下次 tick */
+let _secCloneAcc = 0;
+function clonePushTick(){
+  if(!frCloneUnlocked()) return;
+  if(S.realm !== 'lmg') return;
+  const hrs = 1 / 3600;
+  _clonePushAcc += hrs;
+  /* 攒够 1 秒的量就推一次；不足则继续累积（等价于「每秒推进」但只做整数关） */
+  if(_clonePushAcc < hrs) return;
+  const use = _clonePushAcc; _clonePushAcc = 0;
+  /* 1.56：挂机目标为秘境 —— 分身改在秘境逐层推进（不推凡人界关卡、不转生） */
+  if(cloneTargetSecret()){
+    cloneSecretStep(use);
+    if($('frCloneOverlay') && $('frCloneOverlay').classList.contains('show')) renderFrClone();
+    return;
+  }
+  if(!cloneAutoNextOn() && !cloneAutoRbOn()) return;
+  if(cloneAutoNextOn()) offlineFrPush(use, true);
+  if(cloneAutoRbOn()){
+    const need = rebirthNeed();
+    if((S.level || 1) >= need && cloneDoRebirth()) toast('分身代为转生（第 ' + need + ' 关）');
+  }
+  /* 面板开着时同步刷新，否则数字仍不动 */
+  if($('frCloneOverlay') && $('frCloneOverlay').classList.contains('show')) renderFrClone();
+}
+function startClonePushTick(){
+  if(_clonePushTimer) clearInterval(_clonePushTimer);
+  _clonePushTimer = setInterval(clonePushTick, 1000);
+}
+function startFrCloneTick(){
+  if(frCloneTimer) clearInterval(frCloneTimer);
+  frCloneTimer = setInterval(function(){
+    if(!frCloneUnlocked()) return;
+    if(S.realm !== 'lmg') return;
+    /* 1.56：秘境模式下产出已在 cloneSecretStep 里逐层发放，此处不再重复结算凡人界 */
+    if(!cloneTargetSecret()) frCloneApply(FR_CLONE_TICK_SEC / 3600);
+    cloneAutoStep();                          /* 1.56：分身顺带打理凡人界（推关 / 转生） */
+  }, FR_CLONE_TICK_SEC * 1000);
+}
+let frCloneTimer = null;
+
+/* ---------- 洞府在线 tick ---------- */
+const CAVE_TICK_SEC = 300;                 /* 每 5 分钟结算一次（在线） */
+function startCaveTick(){
+  if(caveTimer) clearInterval(caveTimer);
+  caveTimer = setInterval(function(){
+    if(!S.lmgUnlocked) return;
+    const r = caveApply(CAVE_TICK_SEC / 3600);
+    if(r) renderCaveTop();
+  }, CAVE_TICK_SEC * 1000);
+}
+function stopCaveTick(){ if(caveTimer){ clearInterval(caveTimer); caveTimer = null; } }
+let caveTimer = null;
+
+/* ---------- 灵界主控条 ---------- */
+/* 1.56 自动转生开关：宝物「自在轮回印」(arb) 提供的是【智能】自动转生（推到极限才转），
+   此前买了就永久生效、无法关闭。现提供显式开关，买后才有、默认关，玩家可自行决定。 */
+function toggleAutoRebirth(){
+  S.autoRb = !S.autoRb;
+  S.arbStuckTs = Date.now();         /* 重置卡关计时，开关后重新累计 */
+  toast('自动转生：' + (S.autoRb ? '开（达门槛并推到极限后自动转）' : '关'));
+  logMsg('自动转生 → ' + (S.autoRb ? '开' : '关'));
+  renderFrAutoRb(); save();
+}
+/* 旧名保留：内部转发到统一的 renderAutoBar（自动转生 / 自动重置共用同一排） */
+function renderFrAutoRb(){
+  if(typeof renderAutoBar === 'function'){ renderAutoBar(); return; }
+}
+function toggleLmgAutoNext(){
+  S.lmgAutoNext = (S.lmgAutoNext === false);
+  toast('自动推关：' + (S.lmgAutoNext !== false ? '开' : '关（击杀后停在当前关）'));
+  logMsg('灵界自动推关 → ' + (S.lmgAutoNext !== false ? '开' : '关'));
+  renderLmgCtrl(); save();
+}
+function renderLmgCtrl(){
+  if(typeof renderFrAutoRb === 'function') renderFrAutoRb();
+  const bar = $('lmgCtrl'); if(!bar) return;
+  const on = (S.realm === 'lmg');                 /* 选关 / 自动推关 属灵界主控，凡人界一律不显示 */
+  bar.style.display = on ? '' : 'none';
+  if(!on) return;
+  const t = $('lmgCtrlLv');
+  if(t) t.textContent = lmgInTrial() ? ('心魔试炼 · 已成功 ' + lmgTrialWin() + ' 次') : ('灵界 第 ' + nStr(S.lmgLevel || 1) + ' 关');
+  const b = $('lmgAutoBtn');
+  if(b){
+    const auto = (S.lmgAutoNext !== false);
+    b.textContent = '自动推关：' + (auto ? '开' : '关');
+    b.classList.toggle('off', !auto);
+    b.style.display = lmgInTrial() ? 'none' : '';
+  }
+  const ex = $('lmgTrialExit');
+  if(ex) ex.style.display = lmgInTrial() ? '' : 'none';
+}
+
+/* ---------- 心魔试炼面板（原妖王挑战） ---------- */
+function openLmgBoss(){
+  if(!S.lmgUnlocked){ toast('启灵后开启'); return; }
+  renderLmgBoss(); $('lmgBossOverlay').classList.add('show');
+}
+function closeLmgBoss(){ const o = $('lmgBossOverlay'); if(o) o.classList.remove('show'); }
+function renderLmgBoss(){
+  const w = lmgTrialWin(), eq = lmgTrialEqLv();
+  const cur = $('bossCurLv'); if(cur) cur.textContent = nStr(w);
+  const g = $('bossInfoGrid');
+  if(g){
+    g.innerHTML =
+      '<div class="lmg-kv"><span>第几次</span><b class="hi">第 ' + nStr(w + 1) + ' 次</b></div>' +
+      '<div class="lmg-kv"><span>心魔血量</span><b>' + dStr(lmgTrialHp()) + '</b></div>' +
+      '<div class="lmg-kv"><span>心魔攻击</span><b>' + dStr(lmgTrialAtk()) + '</b></div>' +
+      '<div class="lmg-kv"><span>本次词条</span><b class="hi">' + (lmgAffNames().join('　') || '—') + '</b></div>';
+  }
+  const dr = $('bossDropRow');
+  if(dr){
+    dr.innerHTML = '洗练石 ×' + (2 + Math.floor(w / 3)) + ' 必掉 · 另有法宝 / 符文掉落';
+  }
+  const q = $('bossMaxQ');
+  if(q){
+    const mq = lmgTrialMaxQ();
+    q.innerHTML = '<span style="color:' + ARTI_QC[mq] + '">' + ARTI_Q[mq] + '</span>' +
+      (mq < 4 ? '<i style="font-style:normal;color:#7a7060;font-size:10px"> 再胜 ' + (TRIAL_Q_GATE[mq + 1] - w) + ' 次升级</i>' : '');
+  }
+}
+function doLmgBoss(){ closeLmgBoss(); lmgTrialEnter(); }
+
+/* ---------- 开发者调试（仅 DEV_MODE） ---------- */
+function openDev(){ if(!DEV_MODE) return; const ov = $('devOverlay'); if(ov) ov.classList.add('show'); }
+function closeDev(){ const ov = $('devOverlay'); if(ov) ov.classList.remove('show'); }
+function devGive(what, n){
+  if(!DEV_MODE) return;
+  /* 1.48：补回 soul 分支 —— DEV 面板一直有「灵魂 +10万 / +1亿 / +100亿」三个按钮，
+     但 devGive 里没有对应分支，点了静默无效（只弹其它资源的渲染）。
+     走 soulNum() 读取 + capRes 写入，与 1.33 的灵魂收敛口径一致。 */
+  if(what === 'soul'){ resAdd('soul', n); toast('灵魂 +' + nStr(n)); }
+  else if(what === 'stone'){ S.lmgStone = Math.min((S.lmgStone||0) + n, SAFE_INT); toast('灵石 +' + nStr(n)); }
+  else if(what === 'power'){ S.lmgPower = dadd(_toD(S.lmgPower||0), D(n)); toast('灵力 +' + nStr(n)); }
+  else if(what === 'exp'){ S.lmgPetExp = dadd(petExpPool(), D(n)); toast('灵兽经验 +' + nStr(n)); }
+  else if(what === 'frag'){ const d = petData(); PETS_LMG.forEach(function(p){ d.frag[p.k] = (d.frag[p.k]||0) + n; }); toast('全碎片 +' + n); }
+  renderNow(); renderLmgPet(); renderLmgPetRow(); renderLmgPlvRow(); save();
+}
+function devAllPets(){
+  if(!DEV_MODE) return;
+  const d = petData();
+  PETS_LMG.forEach(function(p){ if(!d.owned[p.k]) d.owned[p.k] = {k:p.k, lv:1, star:0, reb:0}; });
+  if(!d.on) d.on = PETS_LMG[PETS_LMG.length-1].k;
+  toast('已解锁全部灵兽'); renderNow(); renderLmgPet(); renderLmgPetRow(); renderLmgPlvRow(); save();
+}
+function devPetMax(){
+  if(!DEV_MODE) return;
+  const p = lmgPetOn(); if(!p){ toast('未出战灵兽'); return; }
+  const o = petData().owned[p.k];
+  o.star = PET_STAR_MAX; o.lv = petLvCap(o);
+  toast('已拉满等级 / 星级'); renderNow(); renderLmgPet(); renderLmgPetRow(); renderLmgPlvRow(); save();
+}
+/* 灵兽转生：自动拉满级满星后连续转生 n 次，用于验证「无限养成」循环
+   （等级上限 +50 / 次，星级保留，自身属性 +50% / 次） */
+function devPetReb(n){
+  if(!DEV_MODE) return;
+  const p = lmgPetOn(); if(!p){ toast('未出战灵兽'); return; }
+  const o = petData().owned[p.k];
+  o.star = PET_STAR_MAX;
+  for(let i=0;i<n;i++){ o.lv = petLvCap(o); lmgPetReb(p.k); }
+  toast('灵兽已转生 ' + o.reb + ' 次，等级上限 ' + petLvCap(o));
+  renderNow(); renderLmgPet(); renderLmgPetRow(); renderLmgPlvRow(); save();
+}
+function devRebirth(n){
+  if(!DEV_MODE) return;
+  S.rebirth = (S.rebirth||0) + n;
+  toast('转生 +' + n + '（当前 ' + S.rebirth + ' 次，飞升门槛 ' + LMG_NEED_REBIRTH + ' 次）');
+  renderNow(); save();
+}
+/* 一键启灵：直接把转生次数补到飞升门槛并进入灵界。
+   测试幽冥魂殿必须先到灵界，而手动刷 100 次转生在测试环境里成本过高 —— 这条捷径只存在于测试版。 */
+function devEnterLing(){
+  if(!DEV_MODE) return;
+  if((S.rebirth||0) < LMG_NEED_REBIRTH) S.rebirth = LMG_NEED_REBIRTH;
+  if(S.realm === 'lmg'){ toast('已在灵界'); return; }
+  enterLing();
+  toast('已启灵（转生 ' + S.rebirth + ' 次）');
+  logMsg('[DEV] 一键启灵');
+}
+function devCult(n){
+  if(!DEV_MODE) return;
+  for(let i=0;i<n;i++){
+    const d = cultRealmDef(S.cultRealm||0);
+    if((S.cultSub||0) < d.subs.length - 1) S.cultSub = (S.cultSub||0) + 1;
+    else if((S.cultRealm||0) < CULT_REALMS.length - 1){ S.cultRealm = (S.cultRealm||0) + 1; S.cultSub = 0; }
+    else break;
+  }
+  toast('修真推进至 ' + cultName()); renderNow(); save();
+}
+/* 1.78：DEV 面板此前只有 18 个按钮，缺洗练石 / 符文碎片 / 资质丹 / 洞府灵玉 / 灵蕴 /
+   矿石 / 灵天赋券 / 宝箱 / 天赋石 / 宝石，也缺凡人界进度（主线·双塔·秘境·BOSS·药园）
+   与一键满级手段 —— 实测时大量内容「加不了、测不了」。这里统一补齐。 */
+function devAddRes(what, n){
+  if(!DEV_MODE) return;
+  if(what === 'shard'){ const d = artiData(); d.stone = (d.stone || 0) + n; toast('洗练石 +' + nStr(n)); }
+  else if(what === 'rshard'){ const d = runeData(); d.shard = (d.shard || 0) + n; toast('符文碎片 +' + nStr(n)); }
+  else if(what === 'apt'){ const d = petData(); d.aptPill = (d.aptPill || 0) + n; toast('资质丹 +' + n); }
+  else if(what === 'jade'){ const d = caveData(); d.jade = (d.jade || 0) + n; toast('洞府灵玉 +' + nStr(n)); }
+  else if(what === 'ly'){ const d = maiData(); d.ly = (d.ly || 0) + n; toast('灵蕴 +' + nStr(n)); }
+  else if(what === 'ore'){ const d = maiData(); d.ore = (d.ore || 0) + n; toast('矿石 +' + nStr(n)); }
+  else if(what === 'ticket'){ S.lmgTicket = Math.min((S.lmgTicket || 0) + n, SAFE_INT); toast('灵天赋券 +' + n); }
+  else if(what === 'box'){ S.lmgBox = Math.min((S.lmgBox || 0) + n, SAFE_INT); toast('灵界宝箱 +' + n); }
+  else if(what === 'tstone'){ resAdd('tstone', n); toast('天赋石 +' + n); }
+  else if(what === 'gem'){ resAdd('gem', n); toast('宝石 +' + nStr(n)); }
+  else if(what === 'neili'){ nlAdd(n); toast('内力 +' + nStr(n)); }
+  renderNow(); renderLmgPet(); renderLmgPetRow(); renderLmgPlvRow(); save();
+}
+/* 凡人界进度：直接推 FR_BOND 六项的取值来源，用于验证「跨界反哺」的无上限曲线 */
+function devFr(what, n){
+  if(!DEV_MODE) return;
+  if(what === 'lv'){ S.stLv = (S.stLv || 0) + n; S.level = Math.max(S.level || 1, S.stLv); toast('主线最高关 +' + n); }
+  else if(what === 'tower'){ S.towerDone = (S.towerDone || 0) + n; toast('凡人塔 +' + n + ' 层'); }
+  else if(what === 'sb'){ S.sbDone = (S.sbDone || 0) + n; toast('神兵塔 +' + n + ' 层'); }
+  else if(what === 'secret'){ S.secretStage = Math.max(1, (S.secretStage || 1) + n); toast('秘境 +' + n + ' 关'); }
+  else if(what === 'boss'){ S.bossWin = (S.bossWin || 0) + n; toast('BOSS通关 +' + n + ' 次'); }
+  else if(what === 'farm'){ S.farmStage = (S.farmStage || 0) + n; toast('药园 +' + n + ' 阶'); }
+  renderNow(); save();
+}
+/* 修炼全项拉满（13 项，按各自上限；无上限项给 100 级） */
+function devAttrMax(){
+  if(!DEV_MODE) return;
+  if(!S.lmgAttr) S.lmgAttr = {};
+  ['atk','hp','def','spd','crit','cdm','combo','pen','dodge','hit','gp','gs','gu'].forEach(function(k){
+    const mx = lmgAttrMaxLv(k);
+    lmgAttrSetLv(k, (mx === null || mx === undefined) ? 100 : Math.min(mx, (k === 'spd') ? 1000 : mx));
+  });
+  toast('修炼 13 项已拉满'); renderNow(); save();
+}
+/* 技能点：clsLvAcc 每 CLS_SP_LV 次升级给 1 点 */
+function devSkillPt(n){
+  if(!DEV_MODE) return;
+  S.clsLvAcc = (S.clsLvAcc || 0) + n * (typeof CLS_SP_LV !== 'undefined' ? CLS_SP_LV : 10);
+  toast('技能点 +' + n); renderNow(); save();
+}
+/* 灵天赋：全部抽到满级（TAL_MAX_LV） */
+function devTalMax(){
+  if(!DEV_MODE) return;
+  if(!S.lmgTalents || Array.isArray(S.lmgTalents)) S.lmgTalents = {};
+  LMG_TALENTS.forEach(function(t){ S.lmgTalents[t.k] = TAL_MAX_LV; });
+  toast('灵天赋全部 Lv.' + TAL_MAX_LV); renderNow(); save();
+}
+/* 洞府五条产线拉到 n 级 */
+function devCaveMax(n){
+  if(!DEV_MODE) return;
+  const d = caveData();
+  CAVE_LINES.forEach(function(l){ d.lv[l.k] = n; });
+  toast('洞府全产线 Lv.' + n); renderNow(); save();
+}
+/* 灵脉小节点拉到 n 级（不扣资源，仅置等级） */
+function devMaiMax(n){
+  if(!DEV_MODE) return;
+  const m = maiData();
+  ['fr','lmg'].forEach(function(r){
+    (MAI_SMALL[r] || []).forEach(function(s){
+      if(!m.small[r]) m.small[r] = {};
+      m.small[r][s.k] = n;
+    });
+  });
+  toast('灵脉小节点全 Lv.' + n); renderNow(); save();
+}
+/* 一键领取全部成就（用于验证成就对灵界的百分比） */
+function devAchAll(){ if(!DEV_MODE) return; achClaimAll(); toast('成就已全部领取'); renderNow(); save(); }
+function devLv(n){ if(!DEV_MODE) return; S.lmgLevel = Math.max(1, (S.lmgLevel||1) + n); lmgNewMon(); toast('灵界关卡 +' + n); renderNow(); save(); }
+function devWipePet(){ if(!DEV_MODE) return; S.lmgPet = {frag:{},owned:{},on:null,cd:{},gcd:{},cutUntil:0}; S.lmgPetExp = D(0); toast('灵兽数据已清空'); renderNow(); renderLmgPet(); renderLmgPetRow(); renderLmgPlvRow(); save(); }
+/* ---------- 灵界属性详情弹窗（点击对战区玩家 / 妖魔任一侧） ---------- */
+function openLmgInfo(who){
+  const ov = $('lmgInfoOverlay'); if(!ov) return;
+  const tEl = $('lmgInfoTitle'), bEl = $('lmgInfoBody');
+  if(!tEl || !bEl) return;
+  const lv = S.lmgLevel || 1;
+  const _r = function(k, v){ return '<div class="lmg-row"><span>' + k + '</span><b>' + v + '</b></div>'; };
+  const _pc = function(x){ return (Math.round(x * 1000) / 10) + '%'; };
+  let h = '';
+  if(who === 'm'){
+    const _inT = lmgInTrial();
+    const _blv = lmgBLv();
+    tEl.textContent = _inT ? ('心魔 · 第 ' + (lmgTrialWin() + 1) + ' 次') : ('灵怪物 · 第 ' + lv + ' 关');
+    h += _r('当前血量', dStr(_toD(S.lmgMonHp || D(0))) + ' / ' + dStr(_toD(S.lmgMonMaxHp || D(1))));
+    h += _r('灵攻击', dStr(lmgMonAtkFor(lv)));
+    h += _r('灵闪避', nStr(lmgMonDodge(lv)) + ' 点');
+    h += _r('灵命中', nStr(lmgMonHit(lv)) + ' 点');
+    h += _r('灵穿透', nStr(lmgMonPen(lv)) + ' 点');
+    h += _r('基础减伤', _pc(lmgMonRed(lv)));
+    h += _r('实际减伤（穿后）', _pc(lmgRealMonRed(lv)));
+    h += _r('对玩家有效命中', _pc(lmgHitRate(lmgMonHit(lv), lmgAttrD('dodge'))));
+    /* 1.66：词条与「吃满词条后的实战属性」——玩家此前在属性面板里完全看不到特殊属性 */
+    const _aff = lmgCurAff();
+    if(_aff.length){
+      h += '<div class="lmg-sum" style="margin-top:6px">特殊属性</div>';
+      _aff.forEach(function(k){
+        const a = lmgAffDef(k);
+        if(a) h += _r('<span class="lmg-aff">' + a.n + '</span>', a.d);
+      });
+      /* 1.66：每行标出「是哪个词条在影响它、影响多少」，未受影响的标 — ，
+         否则玩家看到两栏数字相同会以为词条没生效 */
+      const _tag = function(k){ return lmgAffHas(k) ? ' <span class="lmg-aff">' + (lmgAffDef(k) ? lmgAffDef(k).n : k) + '</span>' : ''; };
+      let _ea = lmgMonAtkNow();
+      if(lmgAffHas('gj')) _ea = dmul(_ea, D(LMG_AFF_MUL.gj));
+      h += '<div class="lmg-sum" style="margin-top:6px">词条加成后</div>';
+      h += _r('实际攻击' + _tag('gj'), dStr(_ea) + (lmgAffHas('gj') ? ('　（×' + LMG_AFF_MUL.gj + '）') : '　—'));
+      let _ered = lmgRealMonRed(_blv);
+      if(lmgAffHas('gf')) _ered = Math.min(0.95, _ered + LMG_AFF_MUL.gf);
+      h += _r('实际减伤' + _tag('gf'), _pc(_ered) + (lmgAffHas('gf') ? ('　（+' + Math.round(LMG_AFF_MUL.gf * 100) + '%）') : '　—'));
+      if(lmgAffHas('ms')) h += _r('额外免伤' + _tag('ms'), '×' + LMG_AFF_MUL.ms + '（不受穿透影响）');
+      let _edg = _toD(lmgMonDodge(_blv));
+      if(lmgAffHas('hs')) _edg = dmul(_edg, D(LMG_AFF_MUL.hs));
+      h += _r('实际闪避' + _tag('hs'), nStr(_edg) + ' 点' + (lmgAffHas('hs') ? ('　（×' + LMG_AFF_MUL.hs + '）') : '　—'));
+      h += _r('你的有效命中', _pc(lmgPlayerHit(_blv)) + (lmgAffHas('hs') ? '　↓' : ''));
+      if(lmgAffHas('bz')) h += _r('攻击是否判闪避' + _tag('bz'), '否（必中）');
+      if(lmgAffHas('pf')) h += _r('是否无视你的防御' + _tag('pf'), '是');
+      if(lmgAffHas('kb')) h += _r('你的暴伤保留' + _tag('kb'), Math.round(LMG_AFF_MUL.kb * 100) + '%');
+      if(lmgAffHas('fj')) h += _r('受击反击' + _tag('fj'), Math.round(LMG_AFF_MUL.fj * 100) + '% 几率');
+    }
+  } else {
+    tEl.textContent = ((typeof cultName === 'function') ? cultName() : '道友') + ' · 灵界属性';
+    LMG_ATTR.forEach(function(a){
+      h += _r(a.n + ' Lv.' + lmgAttrLv(a.k), lmgAttrDisp(a));
+    });
+    h += '<div class="lmg-sum">修真 ' + cultName() + '（+' + cultBonus() + '% 灵属性）　转生 ' + (S.rebirth || 0) + ' 次（+' + (S.rebirth || 0) + '%）　凡人修为 +' + (Math.round(frBondBonus() * 10) / 10) + '%</div>'
+      ;
+  }
+  bEl.innerHTML = h;
+  ov.classList.add('show');
+}
+function closeLmgInfo(){ const ov = $('lmgInfoOverlay'); if(ov) ov.classList.remove('show'); }
+
+/* ---------- 灵力升级 / 修炼 / 抽奖 ---------- */
+/* 档位试算（1.99）：在不真实扣灵力的前提下，算出按当前档位能升几级、共花多少。
+   与 maiPlan 同口径 —— 受「当前持有灵力」约束，故卡片上显示的数字就是点了真会花掉的数字。 */
+function lmgUpPlan(k, n){
+  const a = lmgAttrDef(k); if(!a) return {n:0, cost:D(0)};
+  const _mx = lmgAttrMaxLv(k), lv0 = lmgAttrLv(k);
+  const isMax = (n === 0 || n === 'max');
+  const want = isMax ? ((_mx === null) ? Math.min(LMG_UP_MAX_BATCH, 2000) : LMG_UP_MAX_BATCH)
+                     : Math.max(1, Math.floor(n) || 1);
+  let have = _toD(S.lmgPower || D(0)), sum = D(0), lv = lv0, cnt = 0;
+  for(let i = 0; i < want; i++){
+    if(_mx !== null && lv >= _mx) break;
+    const _s = S.lmgAttr[k]; S.lmgAttr[k] = lv;
+    const c = lmgUpCost(k);
+    S.lmgAttr[k] = _s;
+    if(!c || dcmp(dadd(sum, c), have) > 0) break;
+    sum = dadd(sum, c); lv++; cnt++;
+  }
+  return {n:cnt, cost:sum};
+}
+function lmgUpgrade(k){ lmgUpgradeN(k, 1); }
+/* 批量升级（1.43）：×10 / MAX（n=0 表示 MAX）。
+   不能简单 for 循环 n 次后统一扣款 —— 每级成本递增，必须逐档取价；
+   且中途灵力不足时要「停在能负担的最后一级」，而不是整笔失败（否则 MAX 永远点不动）。
+   ★ 关键坑：lmgUpCost 读的是 S.lmgAttr[k] 的当前等级，故必须先临时写入待升到的等级再取价，
+     否则每次都取到同一档的价格（连升 10 级只扣 1 级的钱）。
+   MAX 单次封顶 LMG_UP_MAX_BATCH 级，防止极端存档下循环过长卡住主线程。 */
+const LMG_UP_MAX_BATCH = 100000;
+function lmgUpgradeN(k, n){
+  const a = lmgAttrDef(k); if(!a) return;
+  const _mx = lmgAttrMaxLv(k);
+  if(_mx !== null && lmgAttrLv(k) >= _mx){ toast(a.n + ' 已达等级上限 Lv.' + _mx); return; }
+  const isMax = (n === 0);
+  /* 1.82：资源三项已取消等级上限，若仍按 LMG_UP_MAX_BATCH(10万) 逐档试算会卡住主线程；
+     无等级上限的属性，一次性批量压到 2000 级（纯性能保护，非设计上限，可连点 MAX 继续升）。 */
+  const want = isMax ? ((_mx === null) ? Math.min(LMG_UP_MAX_BATCH, 2000) : LMG_UP_MAX_BATCH)
+                    : Math.max(1, Math.floor(n) || 1);
+  let pw = _toD(S.lmgPower || D(0)), done = 0, spent = D(0), stop = '';
+  for(let i = 0; i < want; i++){
+    const cur = lmgAttrLv(k) + done;
+    if(_mx !== null && cur >= _mx){ stop = '已达上限'; break; }
+    const _save = S.lmgAttr[k]; S.lmgAttr[k] = cur;
+    const c = lmgUpCost(k);
+    S.lmgAttr[k] = _save;
+    if(!c || dcmp(pw, c) < 0){ stop = '灵力不足'; break; }
+    pw = dsub(pw, c); spent = dadd(spent, c); done++;
+  }
+  if(done <= 0){ toast(a.n + '：' + (stop || '无法升级')); return; }
+  S.lmgPower = pw;
+  lmgAttrSetLv(k, lmgAttrLv(k) + done);
+  if(k === 'hp') S.lmgHp = lmgAttrD('hp');
+  logMsg(a.n + ' → Lv.' + lmgAttrLv(k) + '（连升 ' + done + ' 级，消耗 ' + nStr(spent) + ' 灵力）');
+  toast(a.n + ' 连升 ' + done + ' 级' + (stop ? '（' + stop + '）' : ''));
+  renderLing(); save();
+}
+/* 单次抽取（不含扣券与提示，供单抽/十连复用） */
+function lmgDrawRaw(){
+  let tot = 0; TAL_QW.forEach(function(w){ tot += w; });
+  let r = Math.random() * tot, q = 0;
+  for(let i = 0; i < TAL_QW.length; i++){ if(r < TAL_QW[i]){ q = i; break; } r -= TAL_QW[i]; }
+  let pool = talByQ(q);
+  if(!pool.length) pool = LMG_TALENTS;
+  const t = pool[Math.floor(Math.random() * pool.length)];
+  const lv = talGive(t.k);
+  logMsg('灵天赋「' + t.n + '」（' + TAL_QNAME[talQ(t)] + '）' +
+         (lv > 1 ? '　升至 Lv.' + lv : '　首次获得') + ' — ' + t.d);
+  return t;
+}
+function lmgDraw(){
+  if((S.lmgTicket || 0) < 1){ toast('没有灵天赋抽奖券'); return; }
+  S.lmgTicket--;
+  const t = lmgDrawRaw();
+  toast((talLv(t.k) > 1 ? '升级至 Lv.' + talLv(t.k) + '：' : '获得') + TAL_QNAME[talQ(t)] + '灵天赋：' + t.n);
+  renderLing(); renderTal(); save();
+}
+function lmgDrawTen(){
+  if((S.lmgTicket || 0) < 10){ toast('抽奖券不足，十连需 10 张'); return; }
+  S.lmgTicket -= 10;
+  let best = null;
+  for(let i = 0; i < 10; i++){
+    const t = lmgDrawRaw();
+    if(!best || talQ(t) > talQ(best)) best = t;
+  }
+  toast('十连完成！最佳：' + TAL_QNAME[talQ(best)] + '「' + best.n + '」');
+  renderLing(); renderTal(); save();
+}
+/* 灵天赋面板：按品质分组展示，已获得高亮 */
+function renderTal(){
+  const tt = $('lmgTalTicket'); if(tt) tt.textContent = nStr(S.lmgTicket || 0);
+  const owned = talIds();
+  const ti = $('lmgTalInfo');
+  if(ti){
+    let totLv = 0; owned.forEach(function(id){ totLv += talLv(id); });
+    let h = '已获得 <b class="hi">' + owned.length + '</b> / ' + LMG_TALENTS.length +
+            ' 个灵天赋　·　总等级 <b class="hi">' + totLv + '</b><br>';
+    [4,3,2,1,0].forEach(function(q){
+      const got = owned.filter(function(id){
+        const t = LMG_TALENTS.find(function(x){ return x.k === id; });
+        return t && talQ(t) === q;
+      }).length;
+      h += '<span style="color:' + TAL_QCOLOR[q] + '">' + TAL_QNAME[q] + ' ' + got + '/' + talByQ(q).length + '</span>　';
+    });
+    ti.innerHTML = h;
+  }
+  const tl = $('lmgTalList');
+  if(tl){
+    let h = '';
+    [4,3,2,1,0].forEach(function(q){
+      h += '<div class="tal-grp" style="color:' + TAL_QCOLOR[q] + '">' + TAL_QNAME[q] + '</div>';
+      talByQ(q).forEach(function(t){
+        const lv = talLv(t.k), got = lv > 0;
+        h += '<div class="tal-item' + (got ? ' got' : ' miss') + '">'
+          +  '<span class="tal-q" style="color:' + TAL_QCOLOR[q] + '">' + TAL_QNAME[q] + '</span>'
+          +  '<span class="tn" style="color:' + TAL_QCOLOR[q] + '">' + t.n + '</span>'
+          +  '<span class="td">' + talEffDesc(t) + (got ? (lv > 1 ? '　<span style="color:#ffd76a">Lv.' + lv + '</span>' : '　✓') : '') + '</span></div>';
+      });
+    });
+    tl.innerHTML = h;
+  }
+}
+
+/* ---------- 兑换 ---------- */
+function lmgExStone(all){
+  let g;
+  if(all) g = dFloor(resD('gem'));
+  else { g = parseInt(($('lmgExGemIn') || {}).value || '0', 10); }
+  if(isNaN(g)){ toast('请输入有效的宝石数量'); return; }
+  if(!(g > 0)){ toast('请输入要兑换的宝石数量'); return; }
+  g = Math.min(g, dFloor(resD('gem')));
+  if(g < LMG_EX_GEM){ toast('至少需 ' + nStr(LMG_EX_GEM) + ' 宝石'); return; }
+  const get = Math.floor(g / LMG_EX_GEM), use = get * LMG_EX_GEM;
+  resPay('gem', use); S.lmgStone = Math.min((S.lmgStone || 0) + (get || 0), SAFE_INT);   /* 同上：防超安全整数失精 */
+  toast('兑换成功：' + nStr(use) + ' 宝石 → ' + nStr(get) + ' 灵石');
+  renderLing(); save();
+}
+function lmgExPower(all){
+  /* 2.07：内力为大数，全程走大数比较 / 扣减 */
+  const have = nlD();
+  let nD;
+  if(all) nD = have;
+  else {
+    const raw = parseInt(($('lmgExNeiliIn') || {}).value || '0', 10);
+    if(isNaN(raw)){ toast('请输入有效的内力数量'); return; }
+    if(!(raw > 0)){ toast('请输入要兑换的内力数量'); return; }
+    nD = D(raw);
+  }
+  if(dcmp(nD, D(0)) <= 0){ toast('内力不足'); return; }
+  if(dcmp(nD, have) > 0) nD = have;
+  /* 与宝石那条同口径：不足一个汇率单位时明确拒绝，避免「扣了内力却得到 0 灵力」 */
+  if(dcmp(nD, D(LMG_EX_RATE)) < 0){ toast('至少需 ' + nStr(LMG_EX_RATE) + ' 内力'); return; }
+  const get = lmgPowerFromNeili(nD);
+  S.neili = dsub(have, nD);
+  S.lmgPower = dadd(_toD(S.lmgPower || D(0)), get);
+  toast('兑换成功：' + dStr(nD) + ' 内力 → ' + dStr(get) + ' 灵力');
+  renderLing(); save();
+}
+
+/* 凡尘宝箱 → 灵界宝箱（100 : 1） */
+function lmgExBox(all){
+  /* 2.23：兑换数量走 resNum()（受 LMG_BOX_RATE 分档，实际只会取到有限值）；余额扣减走大数 resPay */
+  const boxN = resNum('box');
+  let n;
+  if(all) n = boxN;
+  else { n = parseInt(($('lmgExBoxIn') || {}).value || '0', 10); }
+  if(isNaN(n)){ toast('请输入有效的宝箱数量'); return; }
+  if(!(n > 0)){ toast('请输入要兑换的凡尘宝箱数量'); return; }
+  n = Math.min(n, boxN);
+  const get = Math.floor(n / LMG_BOX_RATE), use = get * LMG_BOX_RATE;
+  if(get <= 0){ toast('至少需 ' + nStr(LMG_BOX_RATE) + ' 个凡尘宝箱'); return; }
+  resPay('box', use);
+  S.lmgBox = Math.min((S.lmgBox || 0) + get, SAFE_INT);
+  toast('兑换成功：' + nStr(use) + ' 凡尘宝箱 → ' + nStr(get) + ' 灵界宝箱');
+  logMsg('兑换灵界宝箱 ×' + nStr(get) + '（消耗凡尘宝箱 ' + nStr(use) + '）');
+  renderLing(); renderBag(); save();
+}
+/* 开启灵界宝箱：有概率出【一种】资源，数量五档随机（欧皇档 0.1%） */
+function openLmgBox(all){
+  if(!(S.lmgBox > 0)){ toast('没有灵界宝箱'); return; }
+  const cnt = all ? Math.min(S.lmgBox, BOX_ALL_MAX) : 1;
+  /* 五档权重累计 */
+  const totW = LMG_BOX_TIERS.reduce(function(s,t){ return s + t.w; }, 0);
+  let hitStone = 0, hitPower = 0, hitJade = 0, hitSoul = 0, hitLy = 0;
+  const tierCnt = [0,0,0,0,0,0,0];
+  for(let i = 0; i < cnt; i++){
+    /* 等概率选一种资源 */
+    const r = LMG_BOX_RES[Math.floor(Math.random() * LMG_BOX_RES.length)];
+    /* 按权重选档位 */
+    let rw = Math.random() * totW, tier = LMG_BOX_TIERS.length - 1;
+    for(let j = 0; j < LMG_BOX_TIERS.length; j++){ rw -= LMG_BOX_TIERS[j].w; if(rw <= 0){ tier = j; break; } }
+    tierCnt[tier]++;
+    /* 该档数量 = 区间内随机整数 */
+    const lo = r.amt[tier * 2], hi = r.amt[tier * 2 + 1];
+    const got = lo + Math.floor(Math.random() * (hi - lo + 1));
+    if(r.k === 'stone')      hitStone += got;
+    else if(r.k === 'power') hitPower += got;
+    else if(r.k === 'jade')  hitJade  += got;
+    else if(r.k === 'soul')  hitSoul  += got;
+    else                     hitLy    += got;
+  }
+  /* 扣减 */
+  if(!isFinite(S.lmgBox) || S.lmgBox < 0) S.lmgBox = 0;
+  if(S.lmgBox > SAFE_INT) S.lmgBox = SAFE_INT;
+  S.lmgBox -= cnt; if(S.lmgBox < 0) S.lmgBox = 0;
+  /* 发放（各资源口径与既有逻辑一致） */
+  S.lmgStone = Math.min((S.lmgStone || 0) + hitStone, SAFE_INT);
+  S.lmgPower = dadd(_toD(S.lmgPower || D(0)), D(hitPower));
+  if(hitJade  > 0){ const _c = caveData(); _c.jade = Math.min(SAFE_INT, (_c.jade || 0) + hitJade); }
+  if(hitSoul  > 0) resAdd('soul', hitSoul);
+  if(hitLy    > 0){ const m = maiData(); m.ly = Math.min(SAFE_INT, m.ly + hitLy); }
+  /* 提示 */
+  let pt = '';
+  if(hitStone > 0) pt += '　灵石 +' + nStr(hitStone);
+  if(hitPower > 0) pt += '　灵力 +' + nStr(hitPower);
+  if(hitJade  > 0) pt += '　洞府灵玉 +' + nStr(hitJade);
+  if(hitSoul  > 0) pt += '　灵魂 +' + nStr(hitSoul);
+  if(hitLy    > 0) pt += '　灵蕴 +' + nStr(hitLy);
+  toast('开启灵界宝箱 ×' + nStr(cnt) + '：' + pt.trim());
+  logMsg('开启灵界宝箱 ×' + nStr(cnt) + '：' + pt.trim());
+  renderLing(); renderMai(); save();
+}
+
+/* ---------- 弹窗 ---------- */
+function openLmgEx(){ renderLing(); $('lmgExOverlay').classList.add('show'); }
+function closeLmgEx(){ $('lmgExOverlay').classList.remove('show'); }
+/* ===== 属性修炼导航 =====
+   灵修（灵力升级）/ 灵天赋 / 修真 三块已合并进「属性修炼」同一个弹窗，
+   这里只负责在弹窗内切换分区；灵兽仍是独立弹窗。 */
+/* 1.64：导航精简 —— 灵天赋 / 职业 / 灵兽 各有独立入口（主页面按钮 / 各自面板），
+   此处只保留「属性修炼」自身的三个分区，避免同一批入口在两处重复出现。 */
+const LMG_NAV = [
+  { k:'cult',  n:'灵力升级', f:function(){ openLmgCult('cult');  } },
+  { k:'realm', n:'修 真',    f:function(){ openLmgCult('realm'); } },
+  { k:'attr',  n:'主角重修', f:function(){ openLmgCult('reb');   } }
+];
+function closeAllLmgNav(){
+  [$('lmgCultOverlay'), $('lmgPetOverlay')].forEach(function(o){
+    if(o) o.classList.remove('show');
+  });
+}
+/* 1.65：职业已是独立弹窗，保留旧入口名指向它（兼容历史调用） */
+function openLmgCls(){ openCls(); }
+/* 属性修炼弹窗内部分区切换：cult=灵力升级 / tal=灵天赋 / realm=修真 / reb=主角重修 */
+function lmgSecShow(tab){
+  const on = function(id, v){ const e = $(id); if(e) e.style.display = v ? '' : 'none'; };
+  on('lmgSecCult',  tab === 'cult');
+  on('lmgSecTal',   tab === 'tal');
+  on('lmgSecRealm', tab === 'realm');
+  on('lmgCultReb',  tab === 'reb');
+}
+/* ══════ 1.61 职业面板 ══════ */
+/* 1.65：职业独立成弹窗（原来占「属性修炼」的一个分区，顶部会带出修真 / 重修导航） */
+function openCls(){
+  if(!S.lmgUnlocked){ toast('启灵后开启'); return; }
+  renderCls(S.cls || CLS_DEF[0].id);
+  const ov = $('clsOverlay'); if(ov) ov.classList.add('show');
+}
+function closeCls(){ const o = $('clsOverlay'); if(o) o.classList.remove('show'); }
+/* 流派效果文案：把 feat 覆盖与 pct 取舍翻译成玩家看得懂的一行字 */
+function clsBrEffTxt(b){
+  const out = [];
+  if(b.feat){
+    if(b.feat.base != null) out.push('\u7279\u8272\u57fa\u7840 ' + b.feat.base);
+    if(b.feat.per  != null) out.push('\u6bcf\u8f6c ' + (b.feat.per > 0 ? '+' : '') + b.feat.per);
+  }
+  if(b.mul){
+    for(const k in b.mul){
+      const d = LMG_ATTR.filter(function(x){ return x.k === k; })[0];
+      const m = b.mul[k];
+      out.push((d ? d.n : k) + ' \u00d7' + m
+        + '\uff08' + (m >= 1 ? '+' : '-') + Math.round(Math.abs(m - 1) * 100) + '%\uff09');
+    }
+  }
+  return out.join('　');
+}
+/* ══════ 1.81：职业技能点击 → 说明弹窗 ══════
+   旧行为：点技能卡 = 直接消耗技能点升级（看不到完整说明就做了决定，且误触不可逆）。
+   新行为：弹出说明（定位 / 伤害口径 / 当前与下一级效果 / 被动加成 / 冷却），升级在弹窗里点。 */
+/* 1.85：说明随强度顺序同步调整 —— 每转解锁的技能依次变强，末位为该职业最强招。 */
+const CLS_SK_DD = {
+  '一剑霜寒': '极速一剑，冷却最短、单发最低，暴击伤害小幅增益。',
+  '剑影随行': '剑影随身连击，攻击力小幅增益。',
+  '破军袭':   '突进破敌，附带暴击伤害增益。',
+  '剑心斩':   '斩出剑气，附带攻击力增益。',
+  '万剑归宗': '凝聚万剑齐落，对单体一次高额伤害。',
+  '太虚剑域': '开阖太虚剑域，攻击力大幅增益。冷却最长、单发最高，为剑修终极一剑。',
+  '双符诀':   '双符并诀分 2 段，冷却最短、总伤最低。',
+  '散符雨':   '符雨洒落分 3 段，连击率小幅增益。',
+  '连诀符':   '符诀连成链分 4 段，攻速小幅增益。',
+  '疾风符':   '疾风符箓分 6 段落下，连击率增益。',
+  '万符朝元': '万符齐发，分 8 段命中。',
+  '万符灭世': '符箓灭世，分 10 段命中，连击率大幅增益，为符修终极一符。',
+  '血脉击':   '激发血脉之力一击，冷却最短、伤害最低。',
+  '磐石冲':   '磐石之躯冲撞，血量上限小幅增益。',
+  '生机爆':   '引动生机冲击，附带防御增益。',
+  '铁壁震':   '震荡大地，按最大血量比例伤害，血量增益。',
+  '不动明王': '化身不动明王，按最大血量的比例轰出重击。',
+  '不灭金身': '不灭金身全力一击，血量上限大幅增益，为体修终极一击。'
+};
+function clsSkEffTxt(sk, lv){
+  const dm = sk.dmg; if(!dm) return '';
+  let e;
+  if(dm.src === 'hp') e = (Math.round((dm.hp + dm.per * lv) * 10) / 10) + '% 最大血量';
+  else e = (Math.round((dm.sec + dm.per * lv) * 100) / 100) + ' 秒普攻' + (((dm.hits || 1) > 1) ? ('　分 ' + dm.hits + ' 段') : '');
+  return e + '　冷却 ' + Math.round(Math.max(10, sk.cd - (sk.cdRed || 0) * lv)) + 's';
+}
+function clsSkPasTxt(sk, lv){
+  if(!sk.pas) return '';
+  const d = LMG_ATTR.filter(function(x){ return x.k === sk.pas.k; })[0];
+  return (d ? d.n : sk.pas.k) + ' +' + (Math.round(sk.pas.per * lv * 10) / 10) + '%'
+       + '（每级 +' + sk.pas.per + '%）';
+}
+function clsSkInfo(cid, i){
+  const c = CLS_DEF.filter(function(x){ return x.id === cid; })[0];
+  if(!c) return;
+  const sk = c.sk[i]; if(!sk) return;
+  const isCur = (S.cls === c.id);
+  const open = isCur && clsSkOpen(i);
+  const lv = isCur ? clsSkLv(i) : 0;
+  const tier = clsSkTierName(i);
+  let h = '<div class="ish-nm">' + sk.n + '</div>'
+    + '<div class="ish-dim">' + c.icon + ' ' + c.n + ' · ' + tier + '转解锁'
+    + (isCur ? (' · Lv.' + lv + ' / ' + CLS_SK_MAX) : ' · 未拥有该职业') + '</div>'
+    + '<div class="ish-line" style="margin-top:6px">' + (CLS_SK_DD[sk.n] || sk.d || '') + '</div>';
+  h += '<div class="ish-grp">伤害</div>'
+    + '<div class="ish-kv"><span>当前 Lv.' + lv + '：' + clsSkEffTxt(sk, lv) + '</span></div>'
+    + '<div class="ish-kv"><span style="color:#7fd0ff">下一级：' + clsSkEffTxt(sk, Math.min(CLS_SK_MAX, lv + 1)) + '</span></div>';
+  if(sk.pas) h += '<div class="ish-grp">被动加成</div><div class="ish-kv"><span>' + clsSkPasTxt(sk, lv) + '</span></div>';
+  h += '<div class="ish-dim" style="margin-top:6px">技能点：主角每升 ' + CLS_SP_LV + ' 级 +1 点'
+    + (isCur ? ('　可用 ' + clsSpFree() + ' 点') : '') + '</div>';
+  if(open){
+    const can = (clsSpFree() > 0) && (lv < CLS_SK_MAX);
+    h += stepBar('cls', function(){ clsSkInfo(cid, i); }, '点一次按此档位升级')
+      + '<div class="ish-ops">'
+      + '<div class="fs-btn ' + (can ? 'b-gold' : 'b-gray') + '" onclick="clsSkDoUpN(' + i + ',\'' + cid + '\')"><span>升级 ' + stepTxt('cls') + '</span></div>'
+      + '</div>';
+  }
+  openItemSheet('技能说明', h);
+}
+function clsSkDoUp(i, cid){ clsSkillUp(i); clsSkInfo(cid, i); }
+function clsSkDoMax(i, cid){ while(clsSpFree() > 0 && clsSkLv(i) < CLS_SK_MAX) clsSkillUp(i); clsSkInfo(cid, i); }
+function renderCls(vid){
+  const body = $('clsBody'), spf = $('clsSpFree'), sm = $('clsSum');
+  if(!body) return;
+  if(spf) spf.textContent = clsSpFree();
+  const reb = S.lmgPReb || 0;
+  /* 1.75b：三职业分页签 —— 点页签查看该职业，切换按钮保留技能等级 */
+  const view = CLS_DEF.filter(function(x){ return x.id === vid; })[0]
+             || clsDef() || CLS_DEF[0];
+  let h = '<div class="cls-tabs">' + CLS_DEF.map(function(c){
+      return '<span class="cls-tab' + (c.id === view.id ? ' on' : '') + '"'
+        + ' onclick="renderCls(\'' + c.id + '\')">' + c.icon + ' ' + c.n
+        + (S.cls === c.id ? '<i>当前</i>' : '') + '</span>';
+    }).join('') + '</div>';
+  if(!S.cls){
+    h += '<div class="lmg-sum" style="text-align:left">重修 <b class="hi">' + CLS_TIER_REB[0]
+      + '</b> 次后解锁（当前 ' + reb + ' 次）</div>';
+    h += '<div class="lmg-attr-grid">'
+      +  '<div class="lmg-attr">'
+      +  '<div class="an">' + view.icon + ' ' + view.n + '</div>'
+      +  '<div class="al">' + view.tag + '</div>'
+      +  '<div class="av">' + view.feat.n + '　' + view.feat.d + '</div>'
+      +  '<div class="ac">' + (reb >= CLS_TIER_REB[0] ? '可解锁' : '未解锁') + '</div>'
+      +  '</div></div>';
+    if(reb >= CLS_TIER_REB[0]){
+      h += '<div class="lmg-btn-row"><div class="fs-btn b-gold" onclick="clsChoose(\''
+        + view.id + '\')"><span>选择 ' + view.n + '</span></div></div>';
+    }
+    body.innerHTML = h;
+    if(sm) sm.textContent = '主角每升 ' + CLS_SP_LV + ' 级 +1 点';
+    return;
+  }
+  /* 已选职业 */
+  const c = view, t = clsTier();
+  const isCur = (S.cls === view.id);
+  if(!c){ body.innerHTML = ''; return; }
+  h += '<div class="lmg-row"><span>' + (isCur ? '当前职业' : '查看职业') + '</span><b class="hi">'
+    + c.icon + ' ' + c.n + '　' + (t >= 1 ? t + ' 转' : '') + '</b></div>';
+  if(!isCur){
+    h += '<div class="lmg-btn-row"><div class="fs-btn b-gold" onclick="clsSwitch(\'' + c.id
+      + '\')"><span>切换为 ' + c.n + '</span></div></div>';
+    h += '<div class="lmg-sum" style="text-align:left;color:#8a8070">技能等级沿用，流派需重选</div>';
+  }
+  const bn = clsBrName();
+  if(bn){
+    h += '<div class="lmg-row"><span>流派</span><b class="hi">' + bn + '</b></div>';
+    const _bm = [];
+    ['atk','hp','def','spd','cdm'].forEach(function(k){
+      const m = clsBrMul(k); if(Math.abs(m - 1) < 0.001) return;
+      const d = LMG_ATTR.filter(function(x){ return x.k === k; })[0];
+      _bm.push((d ? d.n : k) + ' \u00d7' + (Math.round(m * 100) / 100));
+    });
+    if(_bm.length) h += '<div class="lmg-sum" style="text-align:left;color:#ff6b5a">'
+      + '当前取舍：' + _bm.join('　') + '</div>';
+  }
+  /* 特色（1.71：线性 base + per×(转数-1)，支持后续加转数） */
+  /* 1.73：预览也要反映已选流派 —— 但流派位 1 在二转才解锁，故 n < 二转时用默认曲线 */
+  const _b0 = clsBrDef(0);
+  const _fb = (_b0 && _b0.feat && _b0.feat.base != null) ? _b0.feat.base : c.feat.base;
+  const _fp = (_b0 && _b0.feat && _b0.feat.per  != null) ? _b0.feat.per  : c.feat.per;
+  const _fm = (_b0 && _b0.feat && _b0.feat.min  != null) ? _b0.feat.min  : c.feat.min;
+  const fAt = function(n){
+    let b = c.feat.base, p = c.feat.per, m = c.feat.min;
+    if(n >= CLS_BR_TIER[0]){ b = _fb; p = _fp; m = _fm; }
+    let v = b + p * (n - 1);
+    if(m != null) v = Math.max(m, v);
+    return v;
+  };
+  const fv = clsFeatVal();
+  h += '<div class="lmg-row"><span>职业特色 · ' + c.feat.n + '</span><b class="hi">'
+    + (t >= 1 ? (Math.round(fv * 10) / 10 + c.feat.u) : '未激活') + '</b></div>';
+  h += '<div class="lmg-sum" style="text-align:left">' + c.feat.d + '</div>';
+  h += '<div class="lmg-sum" style="text-align:left;color:#8a8070">一转 ' + fAt(1) + c.feat.u
+    + ' → 二转 ' + fAt(2) + c.feat.u + ' → 三转 ' + fAt(3) + c.feat.u
+    + '</div>';
+  /* 流派（二转 / 四转各一次二选一） */
+  if(c.br && isCur){
+    for(let j = 0; j < c.br.length; j++){
+      const bt = CLS_BR_TIER[j], open = clsBrOpen(j), cur = clsBrIdx(j);
+      h += '<div class="lmg-grp">' + bt + ' 转 · 流派 ' + (j + 1)
+        + (open ? '' : '（未解锁）') + '</div>';
+      if(!open){
+        h += '<div class="lmg-sum" style="text-align:left;color:#8a8070">'
+          + '重修 ' + (CLS_TIER_REB[bt - 1] || 0) + ' 次后开启</div>';
+        continue;
+      }
+      h += '<div class="lmg-attr-grid">';
+      c.br[j].forEach(function(b, i){
+        const on = (cur === i);
+        h += '<div class="lmg-attr' + (on ? '' : ' poor') + '" onclick="clsBrPick(' + j + ',' + i + ')">'
+          +  '<div class="an">' + b.n + (on ? '　● 当前' : '') + '</div>'
+          +  '<div class="al">' + (on ? '已选择' : '点击选择') + '</div>'
+          +  '<div class="av">' + b.d + '</div>'
+          +  '<div class="ac">' + clsBrEffTxt(b) + '</div>'
+          +  '</div>';
+      });
+      h += '</div>';
+    }
+  }
+  /* 技能 */
+  h += '<div class="lmg-grp">技能</div>';
+  h += '<div class="lmg-attr-grid">';
+  c.sk.forEach(function(sk, i){
+    const open = clsSkOpen(i), lv = clsSkLv(i);
+    let eff = '';
+    if(sk.tp === 'a'){
+      /* 1.62：伤害技能 —— 显示当前等效强度与冷却 */
+      const dm = sk.dmg;
+      const sc = clsSkDmgScale();
+      if(dm.src === 'hp') eff = (Math.round((dm.hp + dm.per * lv) * sc * 10) / 10) + '% 最大血量';
+      else eff = (Math.round((dm.sec + dm.per * lv) * sc * (dm.hits || 1) * 100) / 100) + ' 秒普攻';
+      eff += '　冷却 ' + Math.round(Math.max(10, sk.cd - (sk.cdRed || 0) * lv)) + 's';
+    }else{
+      eff = '当前 +' + (sk.per * lv) + '%';
+    }
+    h += '<div class="lmg-attr' + (open ? '' : ' poor') + '" onclick="clsSkInfo(\'' + c.id + '\',' + i + ')">'
+      +  '<div class="an">' + sk.n + '</div>'
+      +  '<div class="al">' + (open ? ('Lv.' + lv + '/' + CLS_SK_MAX) : (clsSkTierName(i) + '转解锁')) + '</div>'
+      +  '<div class="av">' + sk.d + '</div>'
+      +  '<div class="ac">' + ((open && isCur) ? (lv >= CLS_SK_MAX ? '已满级' : '升级 · ' + eff)
+                                             : (open ? eff : '未解锁')) + '</div>'
+      +  '</div>';
+  });
+  h += '</div>';
+  body.innerHTML = h;
+  if(sm){
+    sm.innerHTML = '主角每升 ' + CLS_SP_LV + ' 级 +1 点　已用 ' + clsSpUsed() + ' 点'
+      + '<br><span style="font-size:11px;color:#8a8070">各自独立冷却，可自动或点击释放</span>';
+  }
+}
+/* cur: 当前所在页签 key；渲染到 #lmgNavCult（属性修炼） */
+function renderLmgNav(cur){
+  var html = LMG_NAV.map(function(it){
+    var cls = 'lmg-nav-i' + (it.k === cur ? ' on' : '') + (it.k === 'attr' && plvCanReb() ? ' hot' : '');
+    return '<span class="' + cls + '" data-nav="' + it.k + '">' + it.n + '</span>';
+  }).join('');
+  ['lmgNavCult'].forEach(function(id){
+    var el = $(id); if(!el) return;
+    el.innerHTML = html;
+    Array.prototype.forEach.call(el.querySelectorAll('[data-nav]'), function(b){
+      b.onclick = function(){
+        var k = b.getAttribute('data-nav');
+        var it = LMG_NAV.filter(function(x){ return x.k === k; })[0];
+        if(it) it.f();
+      };
+    });
+  });
+}
+function openLmgCult(tab){
+  closeAllLmgNav();
+  tab = (tab === 'reb' || tab === 'tal' || tab === 'realm') ? tab : 'cult';
+  renderLmgNav(tab === 'reb' ? 'attr' : tab);
+  lmgSecShow(tab);
+  renderLing();                       /* 灵力升级 / 灵天赋 两块都由 renderLing 填充 */
+  if(tab === 'realm') renderCult();   /* 修真分区单独填充 */
+  renderLmgPlvReb(); renderFrBond(); renderLmgOffline();
+  $('lmgCultOverlay').classList.add('show');
+}
+function renderLmgPlvReb(){
+  var lv = S.lmgPlv || 1, cap = plvCap(), reb = S.lmgPReb || 0, pool = plvExpPool();
+  var need = plvExpNeed(lv), canReb = plvCanReb();
+  var set = function(id, v){ var e = $(id); if(e) e.textContent = v; };
+  set('plvRebLv', 'Lv.' + lv);
+  set('plvRebCnt', reb + ' 转');
+  set('plvRebCap', 'Lv.' + cap);
+  set('plvRebBonus', '+' + plvBonus() + '%');
+  set('plvRebPool', dStr(pool));
+  set('plvRebNeed', canReb ? '已满级' : dStr(need));
+  var pct = canReb ? 100 : dRatio(pool, need) * 100;
+  var f = $('plvRebFill'), w = $('plvRebTxt'), pw = $('lmgPExpFill');
+  if(f){ f.style.width = pct.toFixed(1) + '%'; f.parentNode.classList.toggle('full', canReb); }
+  if(w) w.textContent = canReb ? '经验已满 · 可重修' : (dStr(pool) + ' / ' + dStr(need));
+  var btn = $('plvRebBtn');
+  if(btn){ btn.style.opacity = canReb ? '1' : '.45'; }
+  /* ── 加成总览：各项加算来源 + 合计 + 凡界压制 + 灵界攻速 ── */
+  var g = $('attrBonusGrid');
+  if(g){
+    var fm = function(v){
+      v = +v || 0;
+      if(Math.abs(v) >= 1e7) return dStr(D(Math.floor(v)));
+      if(Math.abs(v) >= 100) return String(Math.round(v));
+      return String(Math.round(v * 10) / 10);
+    };
+    var rows = [
+      ['主角重修', plvBonus()],
+      ['修真境界', cultBonus()],
+      ['转 生', lmgRebBonus()],
+      ['灵天赋', lmgTalRaw('atk') || 0],
+      ['灵兽被动', petPasSum('atk') || 0],
+      ['凡人修为', frBondBonus() || 0],
+      ['灵界法宝', artiPct('atk') || 0]
+    ];
+    var tot = 0;
+    rows.forEach(function(r){ tot += (+r[1] || 0); });
+    var h = '';
+    rows.forEach(function(r){
+      h += '<div class="lmg-kv"><span>' + r[0] + '</span><b>+' + fm(r[1]) + '%</b></div>';
+    });
+    h += '<div class="lmg-kv"><span>合 计</span><b class="hi">+' + fm(tot) + '%</b></div>';
+    var supK = cultSuppressExp();
+    h += '<div class="lmg-kv"><span>凡界压制</span><b class="hi">×' + dStr(dpow(D(10), supK)) + '</b></div>';
+    var spdX = (lmgTalRaw('spd') || 0) + (petPasSum('spd') || 0);
+    h += '<div class="lmg-kv"><span>灵界攻速</span><b class="hi">+' + fm(spdX) + '%</b></div>';
+    g.innerHTML = h;
+  }
+}
+/* 灵界离线收益预估：按当前关卡 ×60%，不推关 */
+function renderLmgOffline(){
+  const g = $('lmgOffGrid'); if(!g) return;
+  const hrs = offlineCapHrs();
+  const r = lmgOfflineGain(hrs);
+  if(!r){
+    g.innerHTML = '<div class="lmg-kv"><span>状态</span><b>暂无产出</b></div>';
+    const sm2 = $('lmgOffSum');
+    if(sm2) sm2.innerHTML = '需启灵并在灵界，且能击杀当前关';
+    return;
+  }
+  g.innerHTML =
+    '<div class="lmg-kv"><span>时长上限</span><b class="hi">' + hrs + ' 小时</b></div>' +
+    '<div class="lmg-kv"><span>灵力</span><b class="hi">+' + nStr(r.power) + '</b></div>' +
+    '<div class="lmg-kv"><span>灵石</span><b class="hi">+' + nStr(r.stone) + '</b></div>' +
+    '<div class="lmg-kv"><span>灵魂</span><b class="hi">+' + nStr(r.soul) + '</b></div>' +
+    '<div class="lmg-kv"><span>灵兽经验</span><b class="hi">+' + dStr(r.pexp) + '</b></div>' +
+    '<div class="lmg-kv"><span>主角经验</span><b class="hi">+' + dStr(r.plexp) + '</b></div>';
+  const sm2 = $('lmgOffSum');
+  if(sm2){
+    sm2.innerHTML = '挂满 ' + hrs + ' 小时 ≈ 击杀 <b class="hi">' + nStr(Math.floor(r.kills)) + '</b> 只（第 ' +
+      nStr(S.lmgLevel || 1) + ' 关，产出 ×' + Math.round(LMG_OFFLINE_RATE * 100) + '%）。<br>' +
+      '离线<b>不推进层数</b>；洗练石需打心魔 / 妖王。';
+  }
+}
+/* 凡人修为明细：各项进度 + 当前加成（无上限，cap 仅作基准线参照） */
+function renderFrBond(){
+  const g = $('frBondGrid'); if(!g) return;
+  /* 显示口径必须与 frBondPct() 生效值一致：frBondBonus() = Σ 单项 × FR_BOND_NERF。
+     旧版累加的是未乘系数的原始值，面板会比实际加成少显示一个 NERF 倍（1.74 修正）。 */
+  let base = 0, h = '';
+  FR_BOND.forEach(function(it){
+    const raw = frBondRaw(it), cur = frBondOne(it) * FR_BOND_NERF, val = Math.max(0, Number(it.get()) || 0);
+    base += it.max * FR_BOND_NERF;
+    /* 2.00：阶梯增长 —— 标出当前档位与下一档门槛 */
+    const tr = frBondTier(it);
+    const over = '　<i style="font-style:normal;color:#ffd54a">第 ' + tr.n + ' 档 · 下档 ' + nStr(tr.next) + it.unit + '</i>';
+    h += '<div class="lmg-kv"><span>' + it.n + '<i style="font-style:normal;color:#7a7060;font-size:10px"> ' +
+         nStr(Math.floor(val)) + '/' + nStr(it.cap) + it.unit + over + '</i></span><b>+' + (Math.round(cur * 10) / 10) + '%</b></div>';
+  });
+  g.innerHTML = h;
+  const tot = frBondBonus();
+  const f = $('frBondFill'), t = $('frBondTxt');
+  if(f) f.style.width = Math.min(100, tot / base * 100).toFixed(1) + '%';   /* 条封 100%，数值不封 */
+  if(t) t.textContent = '合计 +' + (Math.round(tot * 10) / 10) + '%　基准 +' + (Math.round(base * 10) / 10) + '%　无上限';
+}
+function closeLmgCult(){ $('lmgCultOverlay').classList.remove('show'); }
+/* 灵天赋 / 修真已并入「属性修炼」：保留旧入口名，改为打开对应分区（兼容各处调用） */
+function openLmgTal(){ openLmgCult('tal'); }
+function closeLmgTal(){ closeLmgCult(); }
+/* 「凡人界」总入口：灵界时收纳全部凡人界按钮 */
+function openFrPanel(){ renderFrPanel(); $('frPanelOverlay').classList.add('show'); }
+function closeFrPanel(){ $('frPanelOverlay').classList.remove('show'); }
+function renderFrPanel(){
+  const box = $('frPanelGrid'); if(!box) return;
+  /* 2.12：导航按使用频率重排 —— 常用的排前面，不常用的（天赋 / 丹药 / 药园 / 称号）排最后一排 */
+  const items = [
+    ['openBag','背 包'],['openQuest','任 务'],['openShop','商 店'],['openPet','宠 物'],
+    ['openGongfa','功 法'],['openTreasure','宝 物'],['openAch','成 就'],['openPractice','练 体'],
+    ['openTowers','无限塔'],['openRelic','遗 物'],['confirmSecret','秘 境'],['openMer','经 脉'],
+    ['openWeap','神兵录'],['openBoss','BOSS挑战'],
+    ['openTalent','天 赋'],['openPill','丹 药'],['openFarm','药 园'],['openTitle','称 号']
+  ];
+  let h = '';
+  items.forEach(function(it){
+    h += '<div class="fs-btn b-brown" data-realm="panel" style="cursor:pointer" onclick="closeFrPanel();' + it[0] + '()"><span>' + it[1] + '</span></div>';
+  });
+  box.innerHTML = h;
+}
+
+/* 灵界计时器幂等同步：以「当前界别」为准，灵界则确保妖魔反击 / 灵兽技能计时器在跑，
+   非灵界则一律停掉。旧实现只在 enterLing() 里 startLmgMon()，一旦中途刷新页面
+   （存档恢复 realm='lmg'）计时器不会重启 —— 表现就是「灵界怪物站着不动、玩家不掉血」。 */
+function syncLmgTimers(){
+  if(S.realm === 'lmg'){
+    if(typeof startLmgMon === 'function') startLmgMon();
+    if(typeof startLmgPet === 'function') startLmgPet();
+  }else{
+    if(typeof stopLmgMon === 'function') stopLmgMon();
+    if(typeof stopLmgPet === 'function') stopLmgPet();
+  }
+}
+
+/* ---------- UI ---------- */
+/* 1.56：全部立绘统一由 JS 动态挂载 —— 凡人界 4 张 + 灵界 3 张，同一路径。
+   dataset.done 去重：只写一次 DOM，不参与每帧渲染。
+   ⚠ 凡人界覆盖层（wolfImg/towerImg/towerImgSB）的显示/隐藏仍由 syncEnemyVisual() 独家控制，
+     本函数只负责「把图挂上去」，不碰 display。 */
+function _imgSet(id, url){
+  try{
+    const el = $(id);
+    if(el && !el.dataset.done && url){ el.style.backgroundImage = 'url(' + url + ')'; el.dataset.done = '1'; }
+  }catch(e){}
+}
+function mountAllImgs(){
+  /* 凡人界 */
+  _imgSet('frBossImg',   typeof IMG_FR_BOSS    !== 'undefined' ? IMG_FR_BOSS    : '');
+  _imgSet('wolfImg',     typeof IMG_WOLF       !== 'undefined' ? IMG_WOLF       : '');
+  _imgSet('towerImg',    typeof IMG_TOWER      !== 'undefined' ? IMG_TOWER      : '');
+  _imgSet('towerImgSB',  typeof IMG_TOWER_SB   !== 'undefined' ? IMG_TOWER_SB   : '');
+  /* 灵界 */
+  _imgSet('lmgHeroImg',  typeof IMG_HERO_A     !== 'undefined' ? IMG_HERO_A     : '');
+  _imgSet('lmgFoeImg',   typeof IMG_BOSS_FIEND !== 'undefined' ? IMG_BOSS_FIEND : '');
+  _imgSet('xmHeroImg',   typeof IMG_WRAITH     !== 'undefined' ? IMG_WRAITH     : '');
+}
+function applyRealmUI(){
+  mountAllImgs();
+  const lmg = (S.realm === 'lmg');
+  document.querySelectorAll('.fs-row .fs-btn').forEach(function(b){
+    const r = b.dataset.realm || 'fr';
+    if(r === 'panel'){ return; }                  /* 凡人界总入口内的按钮：不参与界别过滤 */
+    if(r === 'both'){ b.style.display = ''; }
+    else if(r === 'lmg'){ b.style.display = lmg ? '' : 'none'; }
+    else { b.style.display = lmg ? 'none' : ''; }
+  });
+  document.querySelectorAll('.fs-row').forEach(function(row){
+    const vis = Array.prototype.filter.call(row.querySelectorAll('.fs-btn'), function(b){ return b.style.display !== 'none'; });
+    row.style.display = vis.length ? '' : 'none';
+  });
+  ['lmgResStone','lmgResPower'].forEach(function(id){
+    const el = $(id); if(el) el.style.display = lmg ? '' : 'none';
+  });
+  /* 2.16：顶栏图标固定 3 个 —— 凡人界 宝石 / 灵魂 / 内力；灵界 灵力 / 灵石 / 灵魂。
+     「图标已显示的资源」不再出现在下方资源统计里（原先两处重复，一排又放不下）。 */
+  { const _g = $('resGem'), _nl = $('resNeili');
+    if(_g)  _g.style.display  = lmg ? 'none' : '';
+    if(_nl) _nl.style.display = lmg ? 'none' : ''; }
+  /* 灵界：隐藏全部敌人立绘（只留关卡号），切到左右对战布局；返回凡人界时还原立绘 */
+  /* 只在进灵界时隐藏；回凡人界的还原交给下面的 syncEnemyVisual() 统一处理。
+     原写法先无条件写 '' 再被调用 syncEnemyVisual 覆盖，每次切界多一次无效 DOM 写入，
+     且两处并存时后续改动容易出现「设置被悄悄覆盖」的诡异现象。 */
+  if(lmg) document.querySelectorAll('.boss-img').forEach(function(e){ e.style.display = 'none'; });
+  const _ar = $('lmgArena'); if(_ar) _ar.classList.toggle('on', lmg);
+  const _ef = document.querySelector('.enemy-frame'); if(_ef) _ef.classList.toggle('lmg-noimg', lmg);
+  const _hbo = document.querySelector('.hp-bar-outer'); if(_hbo) _hbo.style.display = lmg ? 'none' : '';
+  /* 灵界主控条（选关 / 自动推关 / 退出试炼）：切界必同步。
+     不能只靠 renderLmgArena —— 它只在 render() 的灵界分支里跑，凡人界时根本不执行，
+     主控条会留在上一次灵界的显示状态。 */
+  if(typeof renderLmgCtrl === 'function') renderLmgCtrl();
+  /* 灵界：塔 / BOSS / 秘境模式条一律隐藏（双保险，防止「标题写着凡人塔、实际在打灵界怪」） */
+  ['towerModeBar','bossModeBar','secretModeBar'].forEach(function(id){
+    const _mb = $(id); if(_mb && lmg) _mb.style.display = 'none';
+  });
+  const _pb = $('psnBadge'); if(_pb) _pb.style.display = lmg ? 'none' : '';
+  const _bt = $('bossTag'); if(_bt && lmg) _bt.style.display = 'none';
+  if(!lmg && typeof syncEnemyVisual === 'function') syncEnemyVisual();
+  /* 灵界对战区统一由 render() 的 lmg 分支调用 renderLmgArena()，此处不重复调用：
+     两处并存会造成每次渲染多跑一遍 DOM 查询，且逻辑一旦分叉会出现显示不一致。 */
+  const btn = $('btnLing'); if(btn) btn.textContent = lmg ? '返回凡人界' : '启灵';
+  /* 转生 / 数据统计 属凡人界内容，灵界隐藏 */
+  const _rb = $('btnRebirth'); if(_rb) _rb.style.display = lmg ? 'none' : '';
+  const _dt = document.querySelector('.btn-detail'); if(_dt) _dt.style.display = lmg ? 'none' : '';
+  const _sp = $('statsPanel'); if(_sp) _sp.style.display = lmg ? 'none' : '';   /* 灵界不显示凡人界属性面板 */
+  const _bn = document.querySelector('.bottom-nav'); if(_bn) _bn.style.display = lmg ? 'none' : '';   /* 灵界隐藏底部导航（属性 / 战斗） */
+  if(lmg && typeof switchView === 'function') switchView('battle');   /* 灵界强制留在战斗视图，避免停在已隐藏的属性页 */
+  const lb = $('atkLbl'); if(lb && !lmg) lb.textContent = '攻击 / 毒';   /* 回凡人界还原标签（灵界时由 render 改成「灵攻 / 暴伤」） */
+  syncLmgTimers();          /* 切界 / 读档后都要保证计时器状态与当前界别一致 */
+}
+function renderLing(){
+  const lmg = (S.realm === 'lmg');
+  const sv = $('lmgStoneVal'), pv = $('lmgPowerVal');
+  if(sv) sv.textContent = nStr(S.lmgStone || 0);
+  if(pv) pv.textContent = nStr(S.lmgPower || 0);
+  /* 升级面板 */
+  const box = $('lmgAttrBox');
+  if(box){
+    const _pw = _toD(S.lmgPower);
+    /* 1.99：档位条移到面板顶部统一选择，卡片底部不再各挂 ×10 / MAX 两个小按钮 */
+    let h = stepBar('cult', renderLing, '点击卡片即按此档位连升');
+    [['b','战斗属性'], ['r','资源属性（影响击杀掉落）']].forEach(function(gp){
+      const list = LMG_ATTR.filter(function(a){ return a.g === gp[0]; });
+      if(!list.length) return;
+      h += '<div class="lmg-grp">' + gp[1] + '</div>';
+      h += '<div class="lmg-attr-grid">';
+      list.forEach(function(a){
+        const lv = lmgAttrLv(a.k), c = lmgUpCost(a.k);
+        const _mx = lmgAttrMaxLv(a.k), _maxed = (_mx !== null && lv >= _mx);
+        /* 1.42：修炼收益改为百分比，卡片上直接标出「每级 +N%」，便于与其它系统的 % 口径对照 */
+        const _per = (a.type === 'lin' || a.type === 'fix')
+          ? (a.k === 'spd' ? LMG_SPD_LV_PER : (a.addPct || 0))
+          : null;
+        /* 1.60：修炼等级上限改万级后，攻速每级仅 +0.106%，直接印 3 位小数既难读又显怪，
+           统一按 1 位小数显示（0.1%），保持与其它属性「每级+N%」同样的视觉长度。 */
+        const _perTxt = (_per === null) ? '' : ('　<span style="opacity:.6;font-size:.85em">每级+' + (Math.round(_per * 10) / 10) + '%</span>');
+        /* 1.39 起攻速上限恢复为 1000，「上限=0 表示固定」的特例已不存在，移除 _fixed 分支 */
+        const poor = (c && dcmp(_pw, c) < 0 && !_maxed) ? ' poor' : '';
+        /* 档位 > 1 时改显示「本次连升 N 级的总价」，与灵脉节点卡片同口径 */
+        const _pl = _maxed ? null : lmgUpPlan(a.k, stepIsMax('cult') ? 0 : stepN('cult'));
+        const _costTxt = _maxed ? '已满级'
+          : (stepGet('cult') === 1 ? (nStr(c) + ' 灵力')
+             : (stepTxt('cult') + ' · ' + (_pl.n > 0 ? ('升 ' + _pl.n + ' 级 · ' + nStr(_pl.cost)) : '灵力不足')));
+        h += '<div class="lmg-attr' + poor + (_maxed ? ' maxed' : '') + '" onclick="lmgUpgradeN(\'' + a.k + '\',' + (stepIsMax('cult') ? '0' : 'stepN(\'cult\')') + ')">'
+          +  '<div class="an">' + a.n + '</div>'
+          +  '<div class="al">Lv.' + lv + (_mx !== null ? '/' + _mx : '') + '</div>'
+          +  '<div class="av">' + lmgAttrDisp(a) + _perTxt + '</div>'
+          +  '<div class="ac">' + _costTxt + '</div>'
+          +  '</div>';
+      });
+      h += '</div>';
+    });
+    box.innerHTML = h;
+  }
+  const _cp = $('lmgCultPower');
+  if(_cp) _cp.textContent = nStr(_toD(S.lmgPower));
+  const _rb = S.rebirth||0, _cb = cultBonus();
+  /* 「加成总览」块已按需求移除：修真加成 / 转生加成 / 合计均可在各自面板与底部汇总行查看 */
+  const sm = $('lmgCultSum');
+  if(sm){
+    sm.innerHTML = '修真 ' + cultName() + '　·　转生 ' + _rb + ' 次　·　灵天赋 ' + talIds().length + ' 个'
+      + '<br>合计灵属性加成 <b style="color:#d4af37">+' + (_cb + _rb) + '%</b>'
+      + '<br><span style="font-size:11px;color:#8a8070">点击升级（灵力不足变暗）</span>';
+  }
+  renderTal();
+  /* 兑换面板 */
+  const _gh = $('exGemHave');   if(_gh) _gh.textContent = dStr(dFloor(resD('gem')));
+  const _sh = $('exStoneHave'); if(_sh) _sh.textContent = nStr(S.lmgStone||0);
+  const _gc = $('exGemCan');    if(_gc) _gc.textContent = dStr(dFloor(dmul(resD('gem'), D(1 / LMG_EX_GEM))));
+  const _nh = $('exNeiliHave'); if(_nh) _nh.textContent = dStr(nlD());
+  const _ph = $('exPowerHave'); if(_ph) _ph.textContent = nStr(_toD(S.lmgPower||0));
+  const _ne = $('exNeiliCan');  if(_ne) _ne.textContent = dStr(lmgPowerFromNeili(nlD()));
+  /* 凡尘宝箱 → 灵界宝箱 */
+  const _bh = $('exBoxHave');     if(_bh) _bh.textContent = dStr(dFloor(resD('box')));
+  const _lb = $('exLmgBoxHave');  if(_lb) _lb.textContent = nStr(S.lmgBox||0);
+  const _bc = $('exBoxCan');      if(_bc) _bc.textContent = dStr(dFloor(dmul(resD('box'), D(1 / LMG_BOX_RATE))));
+  const _lb2 = $('lmgBoxHave2');  if(_lb2) _lb2.textContent = nStr(S.lmgBox||0);
+  const _sr = $('lmgSecRealm');
+  if(typeof renderCult === 'function' && _sr && _sr.style.display !== 'none'
+     && $('lmgCultOverlay') && $('lmgCultOverlay').classList.contains('show')) renderCult();
+}
+/* ══════════════════════════════════════════════════════════════
+   隐私政策合规（APP 上架必备）
+   合规要点：① 必须提供「同意」与「拒绝」两个明确按钮
+             ② 勾选框不得默认勾选，须用户主动点击
+             ③ 协议用中文清晰描述，不跳链、不用表格
+             ④ 提供《第三方信息共享清单》（本文第二节，本游戏为「无」）
+   ══════════════════════════════════════════════════════════════ */
+const PV_KEY = 'xtfz_privacy_v1';
+let pvChecked = false;          /* 勾选状态：初始 false，绝不默认勾选 */
+let pvStartPending = false;     /* 是否因未同意而挂起了战斗循环 */
+
+function pvAgreed(){
+  try{ return localStorage.getItem(PV_KEY) === '1'; }catch(e){ return true; }  /* 隐私模式/禁用存储时不阻拦 */
+}
+function pvToggle(){
+  pvChecked = !pvChecked;
+  const c = document.getElementById('pvCheck'), box = document.getElementById('pvBox');
+  if(c) c.classList.toggle('on', pvChecked);
+  if(box) box.textContent = pvChecked ? '✓' : '';
+  const btn = document.getElementById('pvAgree');
+  if(btn) btn.disabled = !pvChecked;
+}
+function pvAgree(){
+  const m = document.getElementById('privacyMask');
+  const isView = m && m.dataset.view === '1';   /* 设置面板进入的「查看」模式 */
+  if(!isView && !pvChecked) return;             /* 未勾选不响应，防误触 */
+  if(!isView){
+    try{ localStorage.setItem(PV_KEY, '1'); }catch(e){}
+    if(pvStartPending){ pvStartPending = false; try{ startAuto(); }catch(e){} }
+    try{ initAudio(); playBgm(); }catch(e){}    /* 同意后（已有用户交互）解锁音频 */
+  }
+  if(m){
+    m.classList.add('hide');
+    m.dataset.view = '';                        /* 恢复为首次启动形态，避免下次误入查看态 */
+    const r = m.querySelector('.pv-reject'); if(r) r.style.display = '';
+    const c = m.querySelector('.pv-check'); if(c) c.style.display = '';
+    const a = document.getElementById('pvAgree'); if(a){ a.textContent = '同 意'; a.disabled = !pvChecked; }
+    const t = m.querySelector('.pv-tip'); if(t) t.textContent = '未同意前无法进入游戏，您可点「拒绝并退出」';
+  }
+}
+/* 设置面板回看：仅展示，含「关闭」按钮，不重复要求勾选 */
+function openPrivacy(){
+  const m = document.getElementById('privacyMask');
+  if(!m) return;
+  m.dataset.view = '1';
+  m.classList.remove('hide');
+  const r = m.querySelector('.pv-reject'); if(r) r.style.display = 'none';
+  const c = m.querySelector('.pv-check'); if(c) c.style.display = 'none';
+  const a = document.getElementById('pvAgree'); if(a){ a.textContent = '关 闭'; a.disabled = false; }
+  const t = m.querySelector('.pv-tip'); if(t) t.textContent = '本游戏不联网、不收集任何个人信息、不接入任何第三方 SDK';
+}
+function pvReject(){
+  /* 先更新 UI（此时 document 仍有效），再尝试退出 —— 顺序不可颠倒：
+     window.close() 后 document 可能已被销毁，之后再访问会抛 TypeError */
+  try{
+    const b = document.querySelector('#privacyMask .pv-btns');
+    if(b) b.style.display = 'none';
+    const t = document.querySelector('#privacyMask .pv-tip');
+    if(t) t.textContent = '您已拒绝本政策，无法进入游戏。请关闭页面，或重开后选「同意」。';
+  }catch(e){}
+  /* 退出 APP：优先走原生接口（WebView 桥接），无则退回网页关闭 */
+  try{
+    if(window.AndroidBridge && typeof window.AndroidBridge.exitApp === 'function'){ window.AndroidBridge.exitApp(); return; }
+  }catch(e){}
+  try{ window.close(); }catch(e){}
+}
+/* 页面载入即判定：同意过则直接隐藏遮罩，不打断正常启动 */
+(function(){
+  if(pvAgreed()){
+    const m = document.getElementById('privacyMask');
+    if(m) m.classList.add('hide');
+  }else{
+    pvStartPending = true;                     /* 未同意：挂起战斗循环，避免后台空跑 */
+  }
+})();
+
+document.addEventListener('DOMContentLoaded', function(){
+  document.querySelectorAll('.fs-row .fs-btn').forEach(function(b){ if(!b.dataset.realm) b.dataset.realm = 'fr'; });
+  applyRealmUI(); renderLing();
+  syncLmgTimers();          /* 读档后若人在灵界，补启妖魔反击 / 灵兽技能计时器 */
+});
+
+function renderPractice(){
+  $('prNeili').textContent = nStr(S.neili);
+  $('prPill').textContent = dStr(resD('gem'));
+  $('prRealm').textContent = S.cultDone>=20 ? '武道通神·武道通神（圆满）' : realmName(S.cultDone);
+  const pane = $('prPaneLianti'); pane.innerHTML='';
+  for(let bi=0; bi<REALMS.length; bi++){
+    const r = REALMS[bi];
+    const sec = document.createElement('div'); sec.className='pr-br';
+    const doneCount = Math.min(4, Math.max(0, S.cultDone - bi*4));
+    sec.innerHTML = '<div class="pr-br-head"><span>'+r.name+'</span><span class="pr-prog">'+doneCount+'/4</span></div>';
+    const grid = document.createElement('div'); grid.className='pr-grid';
+    for(let si=0; si<4; si++){
+      const idx = bi*4+si; const sub = r.subs[si]; const b = sub.b;
+      const txt = bonusScaled(b, bi);
+      const card = document.createElement('div');
+      let cls='pr-card', mid='', btn='';
+      if(idx < S.cultDone){ cls+=' done'; mid='<div class="pr-done">✔ '+txt+'</div>'; }
+      else if(idx === S.cultDone){
+        if(needBreak()){ cls+=' lock'; mid='<div class="pr-bonus lock">需先突破上一大境界</div>'; }
+        else { cls+=' cur'; mid='<div class="pr-bonus">'+txt+'</div>'; btn='<button class="pr-b" onclick="cultivate()">修炼（内力 '+SMALL_COST[idx]+'）</button>'; }
+      } else { cls+=' lock'; mid='<div class="pr-bonus lock">'+txt+'</div>'; }
+      card.className=cls;
+      card.innerHTML='<div class="pr-name">'+sub.n+'</div>'+mid+btn;
+      grid.appendChild(card);
+    }
+    sec.appendChild(grid);
+    if(bi>0 && S.cultDone===bi*4 && S.brokeCount < bi){
+      const cost = BREAK_GEM[bi-1]; const can = resHas('gem', cost);
+      const bb=document.createElement('button');
+      bb.className='pr-break'; bb.disabled=!can;
+      bb.textContent='突破至 '+REALMS[bi].name+'（宝石 '+nStr(cost)+'）';
+      bb.onclick=breakthrough;
+      sec.appendChild(bb);
+    }
+    pane.appendChild(sec);
+  }
+  if(S.cultDone>=20){
+    const tip=document.createElement('div'); tip.className='pr-ling';
+    tip.innerHTML='已臻武道通神·武道通神，圆满！<br><span>后续境界敬请期待</span>';
+    pane.appendChild(tip);
+  }
+}
+function cultivate(){
+  if(S.cultDone>=20){ toast('已至武道通神·武道通神，圆满'); return; }
+  if(needBreak()){ toast('请先突破 '+REALMS[Math.floor(S.cultDone/4)].name); return; }
+  const cost = SMALL_COST[S.cultDone];
+  if(!nlHas(cost)){ toast('内力不足（需 '+cost+'）'); return; }
+  S.neili = dsub(nlD(), D(cost)); S.cultDone++;
+  logMsg('修炼成功：'+realmName(S.cultDone-1)+'（内力 -'+cost+'）');
+  toast('修炼 '+realmName(S.cultDone-1)+' 成功');
+  render(); renderPractice(); save();
+}
+function breakthrough(){
+  if(S.cultDone>=20){ toast('已臻圆满'); return; }
+  if(!needBreak()){ toast('暂无可突破境界'); return; }
+  const gate = S.cultDone/4 - 1;
+  const cost = BREAK_GEM[gate];
+  if(!resHas('gem', cost)){ toast('宝石不足（需 '+nStr(cost)+'）'); return; }
+  resPay('gem', cost);
+  S.brokeCount++;
+  const gb = BREAK_GATES[S.brokeCount-1];
+  const gtxt = gb ? ' · 破境加成：'+bonusText(gb) : '';
+  logMsg('突破成功！晋入 '+REALMS[S.brokeCount].name+'（宝石 -'+nStr(cost)+'）'+gtxt);
+  toast('突破成功！晋入 '+REALMS[S.brokeCount].name+gtxt);
+  render(); renderPractice(); save();
+}
+
+/* ============ 秘境（集成到主界面战斗） ============ */
+
+/* 保存原始主线怪物图片 */
+/* 幂等同步秘境 UI（狼图显隐 + 信息条显隐）——唯一 UI 入口，杜绝"半进入"状态 */
+function applySecretUI(){
+  var on = !!S.inSecret;
+  var bar = $("secretModeBar");
+  if(bar) bar.style.display = on ? "" : "none";
+  if(!on){                                                 /* 离开秘境：隐藏首领标签 */
+    var t = $("bossTag"); if(t) t.style.display = "none";
+  }
+  syncEnemyVisual();                                       /* 同上 */
+  if(typeof renderAutoBar === 'function') renderAutoBar();   /* 1.56：进出秘境立刻切换自动行内容 */
+}
+
+function confirmSecret(){ $("secretConfirm").classList.add("show"); }
+function cancelSecret(){ $("secretConfirm").classList.remove("show"); }
+
+function secretMaxHpFor(stage){ return dmul(D(120), dpow(D(1.26), stage-1)); }
+
+/* ---- 1.56 秘境自动重置 ----
+   宝物「轮回秘境印」解锁开关；开启后，若当前层在设定秒数内未能击杀，自动重置秘境。
+   计时起点在 secretInit() 刷新，故每次击杀进入下一层都会重新计时。 */
+function secAutoUnlocked(){ return treHas('secarst'); }
+function secAutoOn(){ return !!S.secAutoReset && secAutoUnlocked(); }
+function secAutoSec(){ const n = Number(S.secResetSec); return isFinite(n) && n > 0 ? Math.max(1, Math.min(600, Math.floor(n))) : 30; }
+function setSecAutoSec(v){
+  const raw = String(v == null ? '' : v).trim();
+  if(raw === '' || !/^-?\d+$/.test(raw)){
+    const keep = secAutoSec();
+    const el0 = $('secAutoSec'); if(el0 && document.activeElement !== el0) el0.value = keep;
+    if(raw !== '') toast('请输入 1~600，已保留 ' + keep + ' 秒');
+    return;
+  }
+  const n = Math.max(1, Math.min(600, parseInt(raw, 10)));
+  S.secResetSec = n;
+  const el = $('secAutoSec');
+  if(el && document.activeElement !== el) el.value = n;
+  toast('秘境自动重置：' + n + ' 秒打不死则重置');
+  if(typeof renderAutoBar === 'function') renderAutoBar();
+  /* 同步分身面板里的秒数框（与主界面秘境信息条是同一份 S.secResetSec） */
+  const _ci = $('cloneSecAutoSec');
+  if(_ci && document.activeElement !== _ci) _ci.value = n;
+  if(typeof renderFrClone === 'function' && $('frCloneOverlay') && $('frCloneOverlay').classList.contains('show')) renderFrClone();
+  save();
+}
+function onBuySecarst(){
+  /* 1.56：买了「轮回秘境印」就直接开启并给明确引导。
+     之前买了仍是默认关，玩家看不到任何变化，会误判成宝物失效。 */
+  if(S.secAutoReset === undefined) S.secAutoReset = true;
+  if(S.secResetSec === undefined) S.secResetSec = 30;
+  toast('已解锁自动重置（默认开启）：' + secAutoSec() + ' 秒打不死怪物则重置');
+  logMsg('轮回秘境印：自动重置已开启（' + secAutoSec() + ' 秒打不死则重置），可在秘境信息条调整');
+}
+function toggleSecAutoReset(){
+  if(!secAutoUnlocked()){
+    toast('需先买宝物「轮回秘境印」（1.2 亿宝石）');
+    if(typeof openTreasure === 'function') openTreasure();   /* 直接打开宝物面板，省得玩家自己找 */
+    return;
+  }
+  S.secAutoReset = !S.secAutoReset;
+  if(S.secAutoReset && S.inSecret) S.secStageTs = Date.now();   /* 开启时从头计时 */
+  renderSecAutoBar();
+  toast('秘境自动重置：' + (S.secAutoReset ? '开' : '关'));
+  logMsg('秘境自动重置：' + (S.secAutoReset ? '开' : '关') + (S.secAutoReset ? ('（' + secAutoSec() + ' 秒）') : ''));
+  /* 分身面板开着时同步刷新 —— 分身处用的是同一份开关状态 */
+  if(typeof renderFrClone === 'function' && $('frCloneOverlay') && $('frCloneOverlay').classList.contains('show')) renderFrClone();
+  save();
+}
+let _sabSig = '';
+/* 1.56：自动重置与自动转生共用同一排，由 renderAutoBar 决定谁显示；
+   本函数只负责「秘境段」内部的开关文本与秒数，不再自己控制整行可见性。 */
+function renderSecAutoBar(){
+  const ul = secAutoUnlocked() ? 1 : 0;
+  const sig = ul + '|' + (secAutoOn() ? 1 : 0) + '|' + secAutoSec();
+  if(sig === _sabSig) return;                                /* 签名缓存，避免每 tick 重复写 DOM */
+  _sabSig = sig;
+  const wrap = $('secAutoWrap'); if(!wrap) return;
+  const b = $('secAutoBtn'), i = $('secAutoSec'), tip = $('secAutoTip');
+  if(!ul){
+    /* 未解锁：按钮压暗并给出获取途径，避免玩家以为功能不存在 */
+    if(b){ b.textContent = '自动重置：未解锁'; b.classList.remove('on'); b.style.opacity = '.55'; }
+    if(tip) tip.textContent = '需宝物「轮回秘境印」';
+    if(i) i.style.display = 'none';
+    return;
+  }
+  if(b){
+    b.textContent = '自动重置：' + (secAutoOn() ? '开' : '关');
+    b.classList.toggle('on', !!secAutoOn());
+    b.style.opacity = '';
+  }
+  if(tip) tip.textContent = '自动重置';
+  if(i){ i.style.display = ''; if(document.activeElement !== i && String(i.value) !== String(secAutoSec())) i.value = secAutoSec(); }
+}
+
+/* 1.56：统一决定「自动行」显示哪一段 —— 互斥，永远只会出现一个 */
+function renderAutoBar(){
+  const bar = $('frAutoRbBar'); if(!bar) return;
+  const a = $('arbWrap'), sw = $('secAutoWrap');
+  const inSec = !!S.inSecret;
+  const showArb = !inSec && treHas('arb') && S.realm !== 'lmg';
+  const showSec = inSec;
+  bar.style.display = (showArb || showSec) ? '' : 'none';
+  if(a) a.style.display = showArb ? 'inline-flex' : 'none';
+  if(sw) sw.style.display = showSec ? 'inline-flex' : 'none';
+  if(showArb){
+    const btn = $('frAutoRbBtn');
+    if(btn) btn.textContent = '自动转生：' + (S.autoRb ? '开' : '关');
+    const tip = $('frAutoRbTip');
+    if(tip) tip.textContent = '自动转生';
+    const si = $('arbSecInput');
+    if(si && document.activeElement !== si && String(si.value) !== String(arbSec())) si.value = arbSec();
+  }
+  if(showSec) renderSecAutoBar();
+}
+
+function secretInit(){
+  if(S.secretStage < 1) S.secretStage = 1;
+  S.secretMaxHp = secretMaxHpFor(S.secretStage);
+  S.secretHp = S.secretMaxHp;
+  S.secStageTs = Date.now();          /* 1.56：自动重置的计时起点，每层刷新重置 */
+}
+
+let secretTimer = null;
+function startSecret(){
+  if(secretTimer) clearInterval(secretTimer);
+  if(!S.secretMaxHp || dcmp(S.secretMaxHp, D(0))<=0 || !S.secretHp || dcmp(S.secretHp, D(0))<=0) secretInit();
+  secretTimer = setInterval(secretTick, S.fps===30?500:(S.fps===120?160:320));
+}
+function stopSecret(){ if(secretTimer){ clearInterval(secretTimer); secretTimer=null; } }
+
+/* 秘境模式下的单次攻击结算(被doHit调用) - 手动点击才闪白 */
+function doSecretHit(manual){
+  hitInc();
+  if(!S.secretHp) secretInit();
+    const _atk = calcAtk();                                /* 缓存攻击力（原每连击段重复计算，段数多时开销大） */
+  let sum = dmul(_atk, D(0.9 + Math.random() * 0.2));
+  let critN = 0, comboN = 0;
+  const crit = Math.random() * 100 < calcCrit();
+  if(crit){ sum = dmul(sum, D(critMult())); critN = 1 + critExtra();
+    }
+  sum = dadd(sum, dmul(_atk, D(calcIgn() / 100)));        /* 无视防御附加真伤（原三模式完全缺失） */
+  { const _cs = {n:0, hit:false};
+    sum = comboAdd(sum, _atk, 0.15, 0.9, 0.2, _cs);
+    if(_cs.hit) comboN += _cs.n; }
+  { const _pn = gfSum('psnhit');
+    if(_pn > 0 && S.poison > 0) sum = dadd(sum, dmul(dmul(D(S.poison), D(_pn)), D(psnMultSum()))); }
+  sum = dmul(sum, D(1 + tSum('nmult') / 100));            /* 猛攻之势 / 屠戮本能 */
+  sum = dmul(sum, D(1 + calcFdm() / 100));                /* 最终伤害乘区 */
+  if(ignAmpMul() > 1) sum = dmul(sum, D(ignAmpMul()));    /* 破界神锋 */
+  S.ndxStack += 1 + tSum('ndxplus');                      /* 不死不休叠层（原三模式完全不叠） */
+  sum = dmul(sum, D(1 + calcNdx() / 100));                /* 不死不休伤害加成 */
+if(manual) S.clicks++;
+  S.poison = Math.min(poisonCap(), S.poison + poisonAdd());
+  S.totalDmg = dadd(S.totalDmg || D(0), sum);
+  S.secretHp = dadd(S.secretHp, dNeg(sum));
+  /* 防止负血量 */
+  if(dcmp(S.secretHp, D(0)) < 0) S.secretHp = D(0);
+
+  let poison = D(0);
+  if(psnPerStack() > 0){ poison = calcPsnDmg(S.poison);
+    S.totalDmg = dadd(S.totalDmg || D(0), poison);
+    S.secretHp = dadd(S.secretHp, dNeg(poison));
+    if(dcmp(S.secretHp, D(0)) < 0) S.secretHp = D(0);
+  }
+  achHit(sum, crit, poison);                           /* 移出毒伤分支 */
+
+  /* 斩杀线天赋（原仅主线判定，秘境中失效） */
+  const _line = tSum('line');
+  if(_line > 0 && dcmp(S.secretHp, dmul(S.secretMaxHp, D(_line / 100))) <= 0 && dcmp(S.secretHp, D(0)) > 0) S.secretHp = D(0);
+  if(dcmp(S.secretHp, D(0)) <= 0){
+    secretKill();   /* 血量归零立即结算下一关（secretKill 会重置为下一关满血，天然防重入） */
+  }
+  return {sum:sum, crit:crit, critN:critN, combo:comboN>0, comboN:comboN, poison:poison};
+}
+
+/* 秘境自动攻击tick - 与手动完全一致（叠毒层+毒伤+击杀），不闪白 */
+function secretTick(){
+  if(!S.inSecret) return;
+  /* 1.56 自动重置：超时未击杀则重置（先于攻击判定，避免白打一下） */
+  if(secAutoOn() && S.secStageTs){
+    if(Date.now() - S.secStageTs >= secAutoSec() * 1000){
+      logMsg('秘境 ' + secAutoSec() + ' 秒打不死怪物，自动重置');
+      toast('秘境自动重置（' + secAutoSec() + ' 秒打不死）');
+      resetSecret();
+      return;
+    }
+  }
+  /* 2.03：按当前攻速批量结算本次 tick 的攻击次数（秘境不再被 fps 间隔锁死在 2~6 次/秒）。
+     n = 攻速 × tick 间隔，至少 1 次；设 SEC_TICK_MAX 上限避免极高攻速时单帧结算过多导致卡顿。 */
+  const _iv = (S.fps === 30 ? 500 : (S.fps === 120 ? 160 : 320));
+  const _a  = (typeof calcAps === 'function') ? calcAps() : 1;
+  let _n = Math.round(((isFinite(_a) && _a > 0) ? _a : 1) * _iv / 1000);
+  if(!isFinite(_n) || _n < 1) _n = 1;
+  if(_n > SEC_TICK_MAX) _n = SEC_TICK_MAX;
+  let r = null;
+  for(let _i = 0; _i < _n; _i++){
+    if(!S.inSecret) break;                 /* 中途退出秘境（切界/自动重置）立即停止 */
+    const _r = doSecretHit(false);
+    if(_r) r = _r;
+    if(_i < _n - 1) continue;              /* 只飘最后一次的字，避免单帧刷屏 */
+  }
+  if(r) popDmg(r, null, lmgDmgHost());
+  renderSecretMode();
+}
+
+/* 1.56：秘境试炼按「当前攻速」加成爆率与内力。
+   设计口径 —— 攻速越高，单位时间击杀越多，若只按「每次击杀」结算，
+   高攻速玩家的秘境收益会被攻速上限（原 APS_CAP=50，1.57 起已取消）压平；
+   故额外给一份随攻速增长的系数，让堆攻速在秘境里有直接回报。
+/* 1.57：攻速取消封顶后，若仍按每点 +8% 线性，满配（约 1210 次/秒）会算出 ×97 —— 失控。
+   改为分段：50 以内维持原 8%/点（手感与封顶时期完全一致），
+   超出 50 的部分按 0.8%/点 计入 —— 仍然随攻速继续增长、不封顶，只是增速放缓。
+   区间：攻速 1 → ×1.00；攻速 50 → ×4.92（与封顶时一致）；攻速 200 → ×6.2；攻速 1210 → ×14.3。 */
+const SEC_APS_PER = 0.08;                    /* 每 1 点攻速 +8%（50 以内） */
+const SEC_APS_PER_HI = 0.008;                /* 超出 50 的部分：每 1 点 +0.8%（不封顶） */
+const SEC_APS_KNEE = 50;
+/* 2.03：单个秘境 tick 内最多结算的攻击次数（防极高攻速时单帧卡顿）。
+   标准档 320ms → 上限 200 次 ≈ 625 次/秒；极速档 160ms → 1250 次/秒，正常玩法远达不到。 */
+const SEC_TICK_MAX = 200;
+function secApsMul(){
+  /* 2.03：秘境掉落不再吃攻速加成，恒返回 1。
+     原设计是「攻速越高 → 每次击杀的掉落率越高」，而 2.03 起秘境已按攻速批量结算攻击次数
+     （打得越快，击杀数本身就越多），掉落若再乘一次攻速就是双重放大 —— 故此处取消。
+     保留函数与常量仅为兼容旧调用点，不再产生任何倍率。 */
+  return 1;
+}
+/* ── 1.90 秘境重复层内力衰减 ────────────────────────────────────────────
+   原机制：秘境每层内力随层数呈平方增长，而重置（手动 / 自动重置 / 分身代打重置）
+   会把层数打回第 1 关 —— 同一批层数可以原路无限重刷，「卡层刷内力」成了最优解，
+   继续推进新层反而没有收益优势，内力因此膨胀失控。
+   现引入「已击杀过的最高层」secBest：
+     · 层数 > secBest（首次打到的新层）→ 内力 100%，破新层的收益完全保留
+     · 层数 ≤ secBest（重置后重刷的旧层）→ 内力 × SEC_REPEAT_RATE
+   反复刷的收益被压到 1/N，首次推进与继续破层不受任何影响。
+   注：判定口径是「已击杀」而非「已到达」，故卡住的那层下次打通时仍算新层（满额）。 */
+/* 2.21：0.15 → 0.05。
+   原 15% 仍足以让「卡层重刷」成为最优解：满配开自动重置时，1 小时可把 1~387 层整段扫 22 轮
+   （实测 8514 击杀 / 65.26B 内力），而真实手动推进新层 1 小时只有约 29 击杀 / 3.04B。
+   降到 5% 后重刷收益约为首通的 1/20，首次破层与继续推进不受任何影响。 */
+const SEC_REPEAT_RATE = 0.05;                    /* 重复层内力倍率（0.05 = 5%） */
+function secBest(){ return Math.max(0, S.secBest || 0); }
+function secIsRepeat(stage){ return (stage || 0) <= secBest(); }
+function secRepeatMul(stage){ return secIsRepeat(stage) ? SEC_REPEAT_RATE : 1; }
+/* 单层内力基准：线性 ×6 + 二次项，首领关 ×5；重复层再乘 SEC_REPEAT_RATE
+   1.91：二次项系数 0.5 → 0.15（A 档温和曲线）；
+   1.92：二次项改为 1.4 次幂（见 SEC_NL_POW 注释），修正后期换灵力过剩。
+   1.93：幂次 1.4 → 1.2，后期仍偏多，继续压平（单层 1000 层 ×0.46、10000 层 ×0.27）。 */
+/* 1.92：内力曲线由「二次」降为「1.4 次幂」—— 后期「内力换灵力过剩」的对症修正。
+   根因：单层内力 ∝ s²，而灵界修炼成本 ∝ lv^1.18（powCost: base×(lv+1)^1.18）。
+   秘境层数随挂机时间线性推进（每 tick +1 层），故内力累计 ∝ t³、灵力需求 ∝ lv^2.18 ——
+   产出增速（层数翻倍 → ×4）远超消耗增速（等级翻倍 → ×2.26），
+   越到后期兑换越过剩（每翻倍过剩约 1.77 倍），这就是「后面感觉太多」的来源。
+   改 1.4 次幂后：层数翻倍 → 内力 ×2.64，与成本 ×2.26 基本持平（过剩降到约 1.17 倍/翻倍）。
+   数值影响（单层基准）：1000 层 ×0.27、5000 层 ×0.08、10000 层 ×0.053
+   —— 前期几乎不变，层数越深削得越多，正对「后期过剩」。
+   1.93：幂次再降 1.4 → 1.2。层数翻倍内力 ×2.64 → ×2.30，与成本 ×2.26 几乎持平，
+   过剩速率由约 1.17 倍/翻倍降到约 1.02 倍/翻倍，后期不再滚雪球。
+   数值影响（相对 1.92，单层基准）：100 层 0.70、1000 层 0.46、5000 层 0.32、10000 层 0.27。 */
+const SEC_NL_POW  = 1.2;                     /* 内力随层数的幂次：调大=更陡（2.0 即恢复平方）
+                                                  1.93：1.4 → 1.2，后期内力换灵力仍偏多，继续压平 */
+const SEC_NL_COEF = 1.2;                       /* 幂项系数：调大即整体提高内力（2.02：2 → 1.2） */
+/* 2.02：内力整体缩放（作用于线性项 + 幂项之和，调小即全线减少）。
+   COEF 只影响幂项，而线性项 (12+2s)×6 在中后期占比很大，单改 COEF 削不动 ——
+   故加一个总闸，与 COEF 配合：相对 2.01 单层内力约降至 0.59（-41%）。 */
+const SEC_NL_SCALE = 0.35;                      /* 2.04：0.7 → 0.35（基础内力砍半） */
+function secNeiliPowTerm(stage){
+  var s = Math.max(0, stage || 0);
+  if(s <= 0) return 0;
+  var v = SEC_NL_COEF * Math.pow(s, SEC_NL_POW);
+  if(!isFinite(v) || v > 9e15) v = 9e15;
+  return v;
+}
+function secNeiliBaseRaw(stage){
+  var nl = Math.floor(((12 + stage*2) * 6 + secNeiliPowTerm(stage)) * SEC_NL_SCALE);
+  if(stage % 10 === 0) nl = Math.floor(nl*5);
+  return nl;
+}
+function secNeiliBase(stage){
+  var nl = secNeiliBaseRaw(stage);
+  if(secIsRepeat(stage)) nl = Math.floor(nl * SEC_REPEAT_RATE);
+  return nl;
+}
+function secMarkBest(stage){ if((stage || 0) > secBest()) S.secBest = stage; }
+function secretKill(){
+  S.ndxStack = 0;                                    /* 击杀后清空不死不休层数（主线 killBoss 已清，此处补齐） */
+  var stage = S.secretStage;
+  /* 单层内力基准（含首领 ×5、重复层衰减） */
+  var nl = secNeiliBase(stage);
+  /* 1.56：内力再乘秘境攻速加成 —— 高攻速在秘境获得直接回报 */
+  nl = Math.floor(nl * secApsMul());
+  if(!isFinite(nl) || nl > 9e15) nl = 9e15;               /* 防超双精度安全整数后扣减失真 */
+  /* 1.91：攻速独立乘区 × 统一加法池（经脉/矿脉/BOSS/功法/遗物/宠物/宝物/称号/兵器 全部相加） */
+  S.neili = dadd(nlD(), dFloor(dmul(D(nl), D(secretNeiliMul()))));
+  S.secretKills++;
+  resAdd('soul', soulGain());                            /* 灵魂：秘境击杀 +1 */
+  S.stSecK = (S.stSecK || 0) + 1;
+  /* 1.56：秘境极低概率掉落化肥（品质越高越难出），受攻速加成影响 */
+  { const _fd = fertRollDrop(secApsMul());
+    if(_fd){ fertAdd(_fd.k, 1); logMsg('秘境掉落【' + _fd.n + '】×1（成熟时间 -' + _fd.d.replace('所有地块成熟时间 -','') + '）'); } }
+  /* 进阶丹资源已取消，境界突破改走宝石；首领关不再掉落任何进阶丹 */
+  /* 秘境关卡进度不再写入日志 */
+  questAdd('kill', 1);
+  /* 1.56：宝箱爆率受攻速加成（原固定 18%） */
+  if(Math.random() < Math.min(0.95, SEC_BOX_BASE * secApsMul())){ resAdd('box', 1); questAdd('getbox', 1); logMsg('秘境掉落凡尘宝箱 ×1'); }
+  /* 1.56：秘境恢复种子掉落（原「不再掉落种子」注释已作废）—— 低概率，含 36/48/72 小时长时档 */
+  { const _si = seedRollDrop(secApsMul());
+    if(_si >= 0){ seedAdd(_si, 1); logMsg('秘境掉落种子【' + SEEDS[_si].n + '】×1'); } }
+  S.poison = 0;                                          /* 每层换怪，毒层从 0 重新叠 */
+  secMarkBest(stage);                                    /* 1.90：记录已击杀最高层（重复层判定基准） */
+  S.secretStage++;
+  secretInit();
+  renderSecretMode(); save();
+}
+
+/* 进入秘境模式：主界面切换为秘境战斗 */
+function enterSecret(){
+  exitLingToFr();                     /* 同上：进入秘境前先返回凡人界 */
+  cancelSecret();
+  if(S.inTower){ exitTower(); }
+  clearBossMode();                    /* 进入秘境时自动退出 BOSS 挑战 */
+  secretInit();
+  S.inSecret = true;
+  S.poison = 0;
+  /* 秘境结算只保留 secretTimer 一路：
+     autoTimer 每次 tick 调 doHit → 会路由到 doSecretHit（第二路伤害），
+     秘境节奏由 S.fps 独立控制（500/320/160ms），本就与攻速无关，停掉 autoTimer 不影响设计意图。 */
+  stopAuto();
+  applySecretUI();
+  startSecret();
+  renderSecAutoBar();
+  renderSecretMode();
+  logMsg("进入秘境! 当前第 " + S.secretStage + " 关");
+  toast("进入秘境 第 " + S.secretStage + " 关");
+  save();
+}
+
+/* 退出秘境模式：恢复主线 */
+function exitSecret(){
+  clearBossMode();                    /* 返回主线时自动退出 BOSS 挑战 */
+  S.inSecret = false;
+  stopSecret();
+  S.secretHp = null;
+  applySecretUI();
+  startAuto();                            /* 退出秘境：恢复主线自动攻击 */
+  render();
+  logMsg("离开秘境，返回主线战斗");
+  toast("返回主线战斗");
+  save();
+}
+
+/* 重置秘境：回到第 1 关，但保持在秘境内（不再返回主线，无需重新进入） */
+function resetSecret(){
+  S.secretStage = 1;
+  S.secretKills = 0;
+  secretInit();                                    /* 重新生成第 1 关满血 */
+  /* 玩家此刻不在秘境内（身处灵界 / 主线，或本次由分身后台触发）：只重置数据，一律不碰 UI。
+     原实现无条件置 S.inSecret = true 再调 applySecretUI() / startSecret()，后果有三：
+     ① syncEnemyVisual() 走 inSecret 分支 → 灵界背景冒出秘境狼图覆盖层（玩家看到的「串画面」）；
+     ② startSecret() 启动 secretTimer → 玩家在灵界的攻击被 doHit 路由到 doSecretHit，打到秘境怪身上；
+     ③ S.poison 被清零 → 抹掉玩家当前所在模式（灵界）的毒层。 */
+  if(!S.inSecret) return;
+  S.poison = 0;
+  var bt = $("bossTag"); if(bt) bt.style.display = "none";   /* 第1关非首领关 */
+  setEnemyImg('main');                             /* 还原普通怪物图 */
+  applySecretUI();
+  startSecret();                                   /* 重启秘境自动攻击 */
+  renderSecAutoBar();
+  renderSecretMode();
+  toast("秘境已重置至第 1 关");
+  logMsg("秘境重置，回到第 1 关");
+  save();
+}
+
+/* 渲染秘境模式主界面 */
+function renderSecretMode(){
+  if(!S.inSecret) return;
+  renderSecAutoBar();                                        /* 有签名缓存，高频调用无开销 */
+
+  $("smStage").textContent = S.secretStage;
+  const isBossStage = (S.secretStage % 10 === 0);          /* 每 10 关为首领关 */
+  $("smBoss").textContent = "";                            /* 首领标识已移至血条上方，此处留空以杜绝换行跳动 */
+  const bt = $("bossTag"); if(bt) bt.style.display = isBossStage ? "" : "none";
+  setEnemyImg(isBossStage ? 'secret' : 'main');             /* 首领关切换专属立绘 */
+  $("smNeili").textContent = nStr(S.neili);
+
+  if(S.secretMaxHp && S.secretHp){
+    var displayHp = dcmp(S.secretHp, D(0)) < 0 ? D(0) : S.secretHp;
+    var ratio = (displayHp.m / S.secretMaxHp.m) * Math.pow(10, Number(displayHp.e - S.secretMaxHp.e));
+    var pct = Math.max(0, Math.min(100, ratio*100));
+    $("hpFill").style.width = pct + "%";
+    $("hpText").textContent = dStr(displayHp) + " / " + dStr(S.secretMaxHp);
+  }
+
+}
+
+
+/* ============ 存档（自动保存 / 启动恢复） ============ */
+/* 存档写入连续失败计数：用于首次失败时提示玩家，避免静默丢进度 */
+let _saveFailed = 0;
+function save(){
+  if(_wiped) return;                                     /* 清档后不再写回 */
+  try{
+    const o = {v:GAME_VER, level:S.level, kills:S.kills, hp:S.hp, maxHp:S.maxHp, clicks:S.clicks, totalDmg:S.totalDmg, rebirth:S.rebirth, pts:S.pts, gem:S.gem, soul:S.soul, neili:S.neili, cultDone:S.cultDone, brokeCount:S.brokeCount, secretStage:S.secretStage, secBest:S.secBest, secretHp:S.secretHp, secretMaxHp:S.secretMaxHp, secretKills:S.secretKills, inSecret:S.inSecret, atkLv:S.atkLv, spdLv:S.spdLv, critLv:S.critLv, cdmLv:S.cdmLv, comboLv:S.comboLv, ignLv:S.ignLv, fdmLv:S.fdmLv, ndxLv:S.ndxLv, psnLv:S.psnLv, plcLv:S.plcLv, ndxStack:S.ndxStack, poison:S.poison, inTower:S.inTower, towerFloor:S.towerFloor, towerHp:S.towerHp, towerMaxHp:S.towerMaxHp, towerType:S.towerType, tstone:S.tstone, drawCnt:S.drawCnt, talents:S.talents, fps:S.fps, showDmg:S.showDmg, simpleDmg:S.simpleDmg, sci:S.sci, meridian:S.meridian, achClaim:S.achClaim, gongfa:S.gongfa, gongfaOff:S.gongfaOff, pets:S.pets, petsOff:S.petsOff, treasures:S.treasures, expDay:S.expDay, expCnt:S.expCnt, impDay:S.impDay, impCnt:S.impCnt, snd_bgm:S.snd_bgm, /* 背景音乐开关持久化 */
+      /* 以下为 v4.0 补全：此前药园 / 遗物 / 丹药 / 任务次数 均未写入存档，刷新即丢失 */
+      /* 1.52 修复：灵脉系统此前【完全未入档】—— 旧版只存 ore/ly 两个数值，
+         而 load() 连这两个都没读，导致小节点 / 大节点 / 共鸣 / 矿脉占领
+         重开游戏后全部归零。今改为整个 S.mai 对象入档。 */
+      mai:S.mai, maiPage:S.maiPage, pickOpen:S.pickOpen, cdkUsed:S.cdkUsed,
+      offTime:S.offTime || 0, onTime:S.onTime || 0,          /* 1.54 离线时间 / 在线时间（小时） */
+      secAutoReset:S.secAutoReset, secResetSec:S.secResetSec, secStageTs:S.secStageTs,   /* 1.56 秘境自动重置 */
+      arbSec:S.arbSec, arbStuckTs:S.arbStuckTs,                                          /* 1.56 自动转生：N 秒打不死则转 */
+      /* 1.57 补：以下 5 项此前只存在于内存，刷新即丢失 ——
+         autoRb（自动转生开关）、cloneTarget（分身挂机目标）是玩家设置，理应持久化；
+         lmgMonHp / lmgMonMaxHp / lmgMonName（灵界当前妖魔）是战斗现场，不存则重开后进度与显示错位。 */
+      autoRb:S.autoRb, cloneTarget:S.cloneTarget,
+      lmgMonHp:S.lmgMonHp, lmgMonMaxHp:S.lmgMonMaxHp, lmgMonName:S.lmgMonName,
+      farmLv:S.farmLv, farmStage:S.farmStage, farmOpen:S.farmOpen, plots:S.plots, seeds:S.seeds, pills:S.pills, pillUse:S.pillUse, relics:S.relics, relicFrag:S.relicFrag, relicAd:S.relicAd, realm:S.realm, lmgUnlocked:S.lmgUnlocked, lmgStone:S.lmgStone, lmgBox:S.lmgBox, lmgPower:S.lmgPower, lmgTicket:S.lmgTicket, lmgBossTicketMax:S.lmgBossTicketMax, lmgTalents:S.lmgTalents, lmgAttr:S.lmgAttr, lmgArti:S.lmgArti, lmgBossFrom:S.lmgBossFrom, lmgTrial:S.lmgTrial, lmgTrialWin:S.lmgTrialWin, lmgTrialFrom:S.lmgTrialFrom, lmgMaxLv:S.lmgMaxLv, lmgAutoNext:S.lmgAutoNext, lmgCave:S.lmgCave, frClone:S.frClone, soulPact:S.soulPact, soulBuy:S.soulBuy, soulDraw:S.soulDraw, lmgRune:S.lmgRune, incense:S.incense, incenseLv:S.incenseLv, incenseFirst:S.incenseFirst, lore:S.lore, lmgAtkLv:S.lmgAtkLv, lmgHpLv:S.lmgHpLv, lmgDefLv:S.lmgDefLv, lmgCultLv:S.lmgCultLv, cultRealm:S.cultRealm, cultSub:S.cultSub, lmgLevel:S.lmgLevel, lmgHp:S.lmgHp, lmgHpVer:LMG_HP_VER, lmgHpPct:lmgHpPct(),
+      fert:S.fert, setArtiQ:S.setArtiQ, setRuneQ:S.setRuneQ, cloneAutoNext:S.cloneAutoNext, cloneAutoRb:S.cloneAutoRb, relicLv:S.relicLv, qt:S.qt, bossCnt:S.bossCnt, bossWin:S.bossWin, boss_fatk:S.boss_fatk, boss_patk:S.boss_patk, boss_cdm:S.boss_cdm, boss_psn:S.boss_psn, boss_plc:S.boss_plc, boss_psnadd:S.boss_psnadd, boss_fdm:S.boss_fdm, boss_neili:S.boss_neili, boss_rb:S.boss_rb, inBoss:S.inBoss, bossWorld:S.bossWorld, bossIdx:S.bossIdx, bossHp:S.bossHp, bossMaxHp:S.bossMaxHp, towerDone:S.towerDone, sbDone:S.sbDone, sbResetDay:S.sbResetDay,
+    /* 凡人塔每日重置日：原漏存，导致重开后 frResetDay 恒为空串 → frResetAvail() 永真 → 可无限刷转生点 */
+    frResetDay:S.frResetDay, shardT:S.shardT, shardL:S.shardL, shardS:S.shardS, weap:S.weap, box:S.box, stHit:S.stHit, qd:S.qd, qp:S.qp, stAtkD:S.stAtkD, stPsnD:S.stPsnD, stCrtD:S.stCrtD, stLmgK:S.stLmgK, stPlant:S.stPlant, stFrF:S.stFrF, stSbF:S.stSbF, stSecK:S.stSecK, stLv:S.stLv, stBox:S.stBox, boxPity:S.boxPity, stRare:S.stRare, gfLv:S.gfLv, petLv:S.petLv, treLv:S.treLv, titles:S.titles, stHarvest:S.stHarvest, titleSeen:S.titleSeen, soulAcc:S.soulAcc,
+      /* 1.58 凡人界深度：功法精研 / 武器淬炼 / 药园种子品类 */
+      gfUp:S.gfUp, weapQ:S.weapQ, seedKinds:S.seedKinds };
+    /* _t 语义 = 「最后一次有效结算时间」，必须在线期间持续推进（每 5 秒的 saveTimer 就是天然心跳）。
+       原实现只写 o._t = Date.now() 却从不回写 S._t，而 checkOffline() 读的是 S._t ——
+       两条路径操作同一语义却各写各的：在线挂机两小时后切后台，S._t 仍是两小时前的旧值，
+       切回时会被算成「离线两小时」，且同一段时长可反复结算（可刷宝箱）。
+       现让 S._t 成为唯一真相源，o._t 只是它的镜像。 */
+    S._t = Date.now();
+    o._t = S._t;
+    o.lmgPet = S.lmgPet; o.lmgPetExp = S.lmgPetExp;
+    o.lmgPlv = S.lmgPlv; o.lmgPExp = S.lmgPExp; o.lmgPReb = S.lmgPReb; o.lmgPBank = S.lmgPBank; o.cls = S.cls; o.clsLv = S.clsLv; o.clsLvAcc = S.clsLvAcc; o.clsSkVer = S.clsSkVer; o.clsBr = S.clsBr; o.clsActT = S.clsActT; o.clsActCd = S.clsActCd; o.clsAutoAct = S.clsAutoAct;
+    /* 关键数值备份快照：检测到篡改时用它回滚（上次正常存档的值）。
+       原只备份 26 个数值字段，改对象型进度（天赋 / 经脉 / 宝物 / 功法 …）无法回滚，只能重签放行；
+       现备份除 _sig/_t/_bak/v 外的全部字段，改任何东西都能还原。 */
+    const bak = {};
+    for(const k in o){
+      if(BAK_SKIP.has(k)) continue;
+      const v = o[k];
+      if(v && typeof v === 'object' && v.m !== undefined) bak[k] = { __d:1, m:String(v.m), e:String(v.e) };
+      /* 普通对象 / 数组只序列化一次后以字符串留存（__s 标记）。
+         原写法 JSON.parse(JSON.stringify(v))：先 stringify 再 parse 还原成对象，
+         随后整体 JSON.stringify(o) 又把它再序列化一遍 —— 同一份数据走了三遍，大存档明显浪费。
+         改为以字符串形式落 _bak 后，最终整体序列化只需直接拷贝字符串。 */
+      else if(v && typeof v === 'object'){ try{ bak[k] = { __s:1, j:JSON.stringify(v, bigRepl) }; }catch(e){ bak[k] = v; } }
+      else bak[k] = v;
+    }
+    o._bak = bak;
+    o._sig = sigOf(o);            /* 防篡改签名（导出时随档一起走，分享不受影响）；签名含 _bak */
+    /* _bak 单独拼接，避免二次序列化：
+       bak 内的对象已存成字符串（__s 标记），若随 o 整体 stringify 会被再转义一遍 ——
+       大存档下等于把整份快照多走一次序列化，保存耗时翻倍。
+       先摘掉 _bak 序列化主体，再把 bak 的 JSON 原文拼到末尾（键序不影响 parse）。 */
+    let _json;
+    try{
+      const bakJson = JSON.stringify(bak, bigRepl);
+      delete o._bak;
+      const body = JSON.stringify(o, bigRepl);
+      _json = body.slice(0, -1) + ',"_bak":' + bakJson + '}';
+      o._bak = bak;               /* 还原，保持 o 完整（导出存档码等处可能复用同一对象） */
+    }catch(_e){ _json = JSON.stringify(o, bigRepl); }
+    localStorage.setItem('xiantu_save', _json);
+    _saveFailed = 0;
+  }catch(e){
+    /* 配额耗尽（典型 5MB 上限）/ 无痕模式下 localStorage 写入会抛异常。
+       原实现是空 catch：玩家会毫无察觉地持续丢进度（每 5 秒一次全丢），
+       且没有任何线索可查。现首次失败即提示，并区分「配额满」与「存储不可用」。 */
+    _saveFailed = (_saveFailed || 0) + 1;
+    if(_saveFailed <= 3){
+      const _q = !!(e && (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED' || e.code === 22 || e.code === 1014));
+      try{ toast(_q ? '存储已满，进度无法保存！请先导出存档' : '无法写入本地存储（无痕模式？），进度不能保存'); }catch(_e){}
+      try{ logMsg('⚠ 存档写入失败：' + (e && e.name || 'unknown') + '，进度未保存'); }catch(_e){}
+    }
+    if(window.console) console.warn('[save] 写入失败', e);
+  }
+}
+/* ==================== 轻量防篡改（防随手改数字，不影响存档分享） ====================
+   存档写入时附签名；读取时重算比对。
+   - 自己导出/导入、分享给别人：签名随档走，完全正常
+   - 用文本编辑器改数字：签名对不上 → 提示并修正，不清档
+   - 老存档无签名：静默补签
+   注：纯前端单机无法 100% 防破解，此为"防随手改"的轻量方案。
+   ================================================================================ */
+const SAVE_SIG_KEY = 'XT-SIG-2024';   /* 固定密钥：保证跨设备分享存档仍有效 */
+/* ===== 签名覆盖范围：存档全部字段（排除签名自身） =====
+   原实现仅覆盖 26 个「关键数值」字段，导致 talents / meridian / achClaim / gongfa / pets /
+   treasures / relics / boss_* 等大量进度字段被改也检测不到 —— 防篡改形同虚设。
+   现改为排除法：只跳过 _sig（签名自身），其余全部纳入摘要，任何字段被改都会破坏签名。
+   ===== 序列化 helpers ===== */
+const SIG_SKIP = new Set(['_sig']);                       /* 仅签名自身不参与 */
+const BAK_SKIP = new Set(['_sig','_t','_bak','v']);       /* 回滚快照排除：签名 / 时间戳 / 自身 / 版本号 */
+/* 稳定序列化：大数转 '#m e'、对象转有序 JSON、其余转字符串；保证同一存档每次结果一致 */
+function serVal(v){
+  if(v === null || v === undefined) return '\u0000';
+  if(typeof v === 'object'){
+    if(v.m !== undefined) return '#' + v.m + 'e' + v.e;
+    /* 数组必须单独处理，不能混进对象分支：
+       · 原分支用 Object.keys().sort() 对下标做「字典序」排序，元素数 ≥11 时顺序变成 0,1,10,11,…,2,3
+         —— 虽然结果仍确定（签名不会误报），但长度越长越反直觉，且与下方新格式不兼容；
+       · 更关键的是原格式把数组写成 {0:…,1:…}，与「键为 0/1 的普通对象」输出完全相同，
+         即 ["a"] 与 {0:"a"} 签名一致 —— 攻击者可把数组替换成同键对象而不触发篡改检测，
+         随后 tSum() 里的 indexOf() 会在运行时抛错，属于类型混淆隐患。
+       现改为数值下标顺序 + 独立的 [ ] 包裹，与对象区分开。 */
+    if(Array.isArray(v)){
+      let a = '[';
+      for(let i = 0; i < v.length; i++) a += serVal(v[i]) + ',';
+      return a + ']';
+    }
+    try{
+      const keys = Object.keys(v).sort();
+      let r = '{';
+      for(let i = 0; i < keys.length; i++) r += JSON.stringify(keys[i]) + ':' + serVal(v[keys[i]]) + ',';
+      return r + '}';
+    }catch(e){ return '{?}'; }
+  }
+  return String(v);
+}
+function sigOf(o){
+  const keys = Object.keys(o).filter(function(k){ return !SIG_SKIP.has(k); }).sort();
+  let str = '';
+  for(let i = 0; i < keys.length; i++) str += keys[i] + '=' + serVal(o[keys[i]]) + ';';
+  let h1 = 5381, h2 = 52711, h3 = 0x811c9dc5;
+  const salt = SAVE_SIG_KEY;
+  for(let i = 0; i < str.length; i++){
+    const c = str.charCodeAt(i) + salt.charCodeAt(i % salt.length);
+    h1 = ((h1 << 5) + h1 + c) >>> 0;
+    h2 = (h2 + (h2 << 7) + c) >>> 0;
+    h3 = ((h3 ^ c) * 16777619) >>> 0;
+  }
+  return h1.toString(36) + '-' + (h2 ^ h3).toString(36) + '-' + ((h1 + h2 + h3) >>> 0).toString(36);
+}
+/* 数值合理性：拦截负数 / NaN / 天文数字 */
+/* 双精度安全整数上限：超过 2^53 后 n-1 与 n 无法区分，
+   宝箱 / 宝石这类「普通 Number 存储且要做减法」的资源必须封顶在此，
+   否则 S.box -= cnt 会静默失效（1e20-200000 仍是 1e20），「全部开启」可无限点。 */
+const SAFE_INT = Number.MAX_SAFE_INTEGER;            /* 9007199254740991 */
+/* 运行时资源累加封顶：SANE_MAX 只在读档时生效，运行时 S.gem += x / S.soul += n 从不封顶。
+   gem 被改到 1e16 后超过 SAFE_INT，加减法开始静默失精（1e20 - 200000 仍是 1e20），
+   「全部开启」这类依赖减法的功能会失效 —— S.box 那处已单独加过保护，其它资源没有。 */
+/* 大数取整：仅对可精确表示的部分生效；超过 1e15 后小数位已无意义，原样返回 */
+function dFloor(x){
+  x = _toD(x);
+  if(x.m === 0 || !isFinite(x.m)) return x;
+  const e = Number(x.e);
+  if(!isFinite(e)) return x;
+  if(e < 0) return {m:0, e:0n};
+  if(e > 15) return x;                                 /* 尾数不可辨，无需再取整 */
+  return D(Math.floor(x.m * Math.pow(10, e)));
+}
+/* ---- 2.07 内力大数读写层 ----
+   S.neili 由普通 Number 改为大数 {m,e}，与灵力 lmgPower 同口径，彻底解除 9.007e15 上限。
+   原上限并非设计意图，而是 Number.MAX_SAFE_INTEGER 的精度天花板：超过后 1e16+1 === 1e16，
+   加减法静默失效（刷到手的内力加不进去、兑换时扣不掉），capRes 只是在精度崩坏前夹住。
+   旧档 neili 仍是普通数字，nlD() 自动兼容，无需迁移。 */
+function nlD(){ const v = S.neili; return (v && typeof v === 'object' && v.m !== undefined) ? v : D(Number(v) || 0); }
+function nlAdd(v){ S.neili = dadd(nlD(), _toD(v)); }
+function nlHas(cost){ return dcmp(nlD(), _toD(cost)) >= 0; }
+function nlPay(cost){ if(!nlHas(cost)) return false; S.neili = dsub(nlD(), _toD(cost)); return true; }
+
+/* ---- 2.23 常规资源大数读写层 ----
+   gem / box / soul / relicFrag / tstone 由普通 Number 改为大数 {m,e}，与 neili、lmgPower 同口径，
+   彻底解除 9.007e15（Number.MAX_SAFE_INTEGER）上限。
+   此前 capRes 只在读档时夹断，运行时 S.gem += x 从不封顶 —— 超过 SAFE_INT 后整数不再连续
+   （1e16 + 1 === 1e16），加减法静默失效：「全部开启」这类依赖减法的功能会失效（扣不掉＝无限白嫖），
+   刷到的资源也可能加不进去。旧档仍是普通数字，resD() 自动兼容，无需迁移。 */
+const RES_BIG = ['gem', 'box', 'soul', 'relicFrag', 'tstone'];
+function resD(k){ const v = S[k]; return (v && typeof v === 'object' && v.m !== undefined) ? v : D(Number(v) || 0); }
+function resSet(k, v){ S[k] = _toD(v); }
+function resAdd(k, v){ S[k] = dadd(resD(k), _toD(v)); }
+function resSub(k, v){ S[k] = dsub(resD(k), _toD(v)); }
+function resHas(k, c){ return dcmp(resD(k), _toD(c)) >= 0; }
+function resPay(k, c){ if(!resHas(k, c)) return false; S[k] = dsub(resD(k), _toD(c)); return true; }
+/* 仅在「确定量级远小于 1e15」的场合取 Number（如与 BOX_ALL_MAX 取 min）；量级过大返回 Infinity，语义仍正确 */
+function resNum(k){ const d = resD(k); const e = Number(d.e); return (e > 15) ? Infinity : Number(d.m) * Math.pow(10, e); }
+function capRes(k, v){
+  const m = SANE_MAX[k];
+  if(m === undefined || !isFinite(v)) return isFinite(v) ? v : 0;
+  if(v > m) return m;
+  if(v < 0) return 0;
+  return v;
+}
+
+/* 注：pill（进阶丹）已废弃（资源取消，境界突破改走宝石），不在此表内；旧档残留由 load() 删除。 */
+/* 2.23：gem / tstone / box / relicFrag / soul 已从本表移除 —— 它们改走大数存储（见 RES_BIG），
+   再夹到 SAFE_INT 会让读档把 1.23e25 削成 9.007Qa，等于把大数改造白做。 */
+const SANE_MAX = { level:1e7, kills:1e12, rebirth:1e6,
+                   farmLv:1e6, farmStage:100, farmOpen:10,
+                   poison:1e12, ndxStack:1e9,
+                   secretStage:1e7, towerFloor:1e7, towerDone:1e7, sbDone:1e7, drawCnt:1e9, bossWin:1e9,
+                   stHit:SAFE_INT, stLmgK:SAFE_INT };
+/* 说明：
+   · farmStage 原 1e4，与 FARM_STAGE_MAX(100) 不一致 —— 改档写 5000 即可绕过进阶上限，
+     进而让 farmGemMul() 巨额放大、farmAdvCost() 溢出。收紧到 100 与逻辑上限对齐。
+   · farmOpen 原无上限：改档写 999 后 i >= S.farmOpen 恒为 false，永不显示锁格（玩家困惑）。
+   · poison / ndxStack 原不在白名单：改档写 1e309 或 'abc' 会一路污染 calcPsn() /
+     Math.min(poisonCap(), S.poison + poisonAdd())，轻则毒伤 NaN，重则累加出天文数字。 */
+/* 注：gem 以普通 Number 存储，安全上限 9.007e15（SANE_MAX 的上限远大于该值，
+   实测到该量级前会先触及浮点精度问题）。
+   neili 自 2.07 起改为大数 {m,e}，已从本表移除 —— 保留会把读档值夹回 9.007e15，
+   使大数改造形同无效（实测 1.2345e25 读档后变 9.01Qa）。 */
+/* 数值合理性修正：拦截负数 / NaN / 天文数字。
+   注意：修正后必须同步修正备份快照 _bak 中的同名字段，否则 sigOf() 会因主值与 _bak 不一致
+        而判定为「篡改」并回滚——合法存档被误杀（如 level 被封顶到 1e7 而 _bak 仍是原值）。 */
+function sanitize(o){
+  const fixed = [];
+  const put = (k, val) => {
+    o[k] = val;
+    /* 同步备份快照，避免修正后的值与快照不一致（否则回滚后又变回未修正的非法值）。
+       类型判定：快照原值是「大数（__d 标记）」才写成大数，是普通数字就仍写数字。
+       原实现一律写成 {m,e}，会把 number 字段变成大数对象，回滚后类型错乱。 */
+    if(o._bak && typeof o._bak === 'object' && !BAK_SKIP.has(k)){
+      /* 一律写修正后的「普通数字」原值 val：
+         原实现在快照原值是大数（__d）时写成 {__d:1, m:String(val), e:'0'} ——
+         e 被写死为 '0'，与 val 的真实量级无关；且回滚时 {m,e} 会把原本的 number 字段
+         变成大数对象（level / kills 等），typeof x === 'number' 之类判断全部失效，类型错乱。
+         经 sanitize 修正后的值必定是普通数字，直接写 val 即可，与 o[k] 类型完全一致。
+         但若快照原值是「对象/数组型」({__s:1,j})，直接写数字会丢掉序列化包裹，
+         快照类型错乱（将来若有代码按 __s 标记解析 _bak 就会踩坑），故按原格式同步。 */
+      /* 一律写修正后的「普通数字」原值 val，不保留 __s / __d 包裹。
+         原因：sanitize 只修正 SANE_MAX 里的数值字段，修正结果必定是普通数字（所有 SANE_MAX 都是数字）。
+         若按快照原格式回写：
+         · 原值是 __d（大数）→ 写成 {__d:1, m, e:'0'}，回滚时把该字段还原成大数对象，
+           而 o[k] 此刻是普通数字 —— 类型错乱，S.kills++ 之类直接变 NaN（1.28 已修过一次，此处曾回退）；
+         · 原值是 __s（对象/数组）→ 把数字塞进序列化包裹，回滚后得到一个「看起来是对象」的数字，同样错乱。
+         快照的作用只是「提供上次合法值」，既然本次修正后的合法值已是数字，快照就该是同一个数字。 */
+      o._bak[k] = val;
+    }
+  };
+  for(const k in SANE_MAX){
+    if(o[k] === undefined || o[k] === null) continue;
+    let v = o[k];
+    if(v && typeof v === 'object' && v.m !== undefined){
+      /* 大数转 Number：e 过大时 Math.pow 直接返回 Infinity，不能简单判为非法。
+         e > 300 表示 ≥1e300，必然超过任何 SANE_MAX，直接封顶；e < -300 视为 0。 */
+      const e = Number(v.e);
+      if(!isFinite(e) || e > 300){ put(k, SANE_MAX[k]); fixed.push(k); continue; }
+      if(e < -300){ put(k, 0); fixed.push(k); continue; }
+      v = Number(v.m) * Math.pow(10, e);
+    }
+    v = Number(v);
+    if(!isFinite(v) || Number.isNaN(v)){ put(k, 0); fixed.push(k); continue; }
+    if(v < 0){ put(k, 0); fixed.push(k); continue; }
+    if(v > SANE_MAX[k]){ put(k, SANE_MAX[k]); fixed.push(k); }
+  }
+  return fixed;
+}
+
+/* 允许从存档恢复的动态字段白名单（S 初始定义中已补齐，此处双保险） */
+const DYN_KEYS = new Set(['cls','clsLv','clsLvAcc','clsSkVer','clsBr','clsActT','clsActCd','clsAutoAct','achClaim','gongfa','gongfaOff','pets','petsOff','treasures','_sig','_t','soulPact','soulBuy','soulDraw','lmgRune','incense','incenseLv','incenseFirst','lore','gfUp','weapQ','seedKinds',
+  'boss_fatk','boss_patk','boss_rb','boss_cdm','boss_psn','boss_plc','boss_psnadd','boss_fdm','boss_neili',
+  /* 1.56 补：save() 已写、默认 S 已声明，此处再列一份双保险，避免将来改动 S 时又漏掉 */
+  'lmgCave','lmgArti','frClone','pickOpen','mai','maiPage','lmgMaxLv','lmgAutoNext','lmgTrial','lmgTrialWin','lmgTrialFrom','lmgBossFrom','snd_bgm',
+  /* 1.57 补：与 save() 新增的 5 项对应（S 已声明，此处双保险） */
+  'autoRb','cloneTarget','lmgMonHp','lmgMonMaxHp','lmgMonName',
+  /* 1.58 补：灵界宝箱 */
+  'lmgBox',
+  /* 1.80 补：灵界累计击杀数（成就 lmgK 口径，此前只存在于内存，刷新即归零） */
+  'stLmgK',
+  /* 1.58 补：第三轮审查发现的 7 个漏存字段（save() 已写或待补，此处与 S 定义双保险） */
+  'fert','setArtiQ','setRuneQ','cloneAutoNext','cloneAutoRb','lmgHpVer','lmgHpPct',
+  /* 离线 / 在线时间：load() 里走专用代码恢复（带上限夹取），不经过通用循环，此处列出仅为文档性双保险 */
+  'offTime','onTime']);
+function load(){
+  try{
+    const o = JSON.parse(localStorage.getItem('xiantu_save'), bigRev);
+    /* ---- 轻量防篡改校验 ---- */
+    if(o){
+      /* 顺序很重要：必须先校验签名，再修正数值。
+         若先 sanitize 再校验，修正后的数值会与原签名不符，导致「合法但超限」的存档被误判为篡改。 */
+      let tampered = false, bad = [];
+      if(o._sig === undefined || o._sig === null){
+        bad = sanitize(o);                     /* 老存档：先修掉负数 / NaN / 天文数字，再静默补签 */
+        o._sig = sigOf(o);
+      } else if(o._sig !== sigOf(o)){
+        /* 先按新格式算一份摘要留存：用于区分「真被篡改」与「签名格式升级」。
+           （1.26 起 serVal 对数组改用独立的 [ ] 包裹 + 数值下标顺序，旧档签名必然对不上，
+             但存档数值本身是好的，不该弹「存档异常」吓玩家。） */
+        const sigLoaded = sigOf(o);
+        tampered = true;                       /* 签名不符：数值被改过 */
+        /* 用备份快照回滚被改的关键数值（备份本身也在签名保护内） */
+        if(o._bak && typeof o._bak === 'object'){
+          for(const k in o._bak){
+            const v = o._bak[k];
+            /* 与 save() 的写入格式对应：__d 标记为大数，其余按原类型还原（含对象深拷贝） */
+            if(v && typeof v === 'object' && v.__d){
+              /* e 字段可能被破坏成非数字字符串：BigInt() 抛错会跳过整个 load()，
+                 玩家看到的是「存档没了」而非「检测到篡改」——必须逐字段兜底。 */
+              try{
+                const _m = Number(v.m), _e = BigInt(String(v.e));
+                if(isFinite(_m)) o[k] = { m:_m, e:_e };
+                else o[k] = 0;
+              }catch(e){ o[k] = 0; }
+            }
+            /* 对象/数组型快照：必须用 bigRev 还原器。
+               原写法 JSON.parse(v.j) 缺还原器 —— 存入时 bigRepl 把 BigInt 转成了 '\u0001数字' 字符串，
+               parse 后仍是字符串，e 字段无法参与 BigInt 运算（dcmp / dadd 全部崩）。
+               丹药改大数存储后 S.pills 走的就是这条 __s 分支，此修复是必需的。 */
+            else if(v && typeof v === 'object' && v.__s){ try{ o[k] = JSON.parse(v.j, bigRev); }catch(e){ o[k] = v.j; } }
+            else if(v && typeof v === 'object'){ try{ o[k] = JSON.parse(JSON.stringify(v)); }catch(e){ o[k] = v; } }   /* 旧档兼容：对象形态 */
+            else o[k] = v;
+          }
+        }
+        bad = sanitize(o);                     /* 回滚后再做一次合理性修正 */
+        /* 回滚后的数值与回滚前完全一致 → 说明只是签名算法/格式变了，存档本身没问题，静默重签即可。
+           （_bak 是上次存档的完整快照，正常存档下与本次载入值逐字段相同。） */
+        if(sigOf(o) === sigLoaded) tampered = false;
+        o._sig = sigOf(o);                     /* 重签：避免修正后的数值在下次读档时再次被判篡改 */
+      } else {
+        bad = sanitize(o);                     /* 签名正常，仅做合理性修正（如超出理论上限后封顶） */
+        if(bad.length) o._sig = sigOf(o);      /* 修正后重签，保持签名与数值一致 */
+      }
+      /* _warn 只用于「检测到篡改」这一种情况（load 末尾据此提示并回滚）。
+         原写法还会在「仅数值封顶」时置为 'sane'，但 'sane' 从未被任何代码读取，
+         属于预留但未使用的死状态 —— 去掉，避免后人误以为存在两种提示分支。 */
+      if(tampered) S._warn = 'tampered';
+    }
+    if(!o) return;
+    /* _t 类型兜底：旧格式可能把时间戳存成大数对象 {m,e}，或被污染成字符串。
+       若不转换，Number(S._t) 得 NaN → checkOffline() 里 sec 为 NaN
+       → Math.min(NaN, capH) = NaN → 判定与结算全部失效，旧档首次加载会白白吞掉离线收益。 */
+    if(o._t !== undefined && o._t !== null){
+      let _tv = o._t;
+      if(_tv && typeof _tv === 'object' && _tv.m !== undefined) _tv = Number(_tv.m) * Math.pow(10, Number(_tv.e));
+      _tv = Number(_tv);
+      o._t = (isFinite(_tv) && _tv > 0) ? _tv : 0;
+    }
+    /* _wolfInitImg 尽早初始化：load() 末尾会走 applySecretUI() → syncEnemyVisual() → setEnemyImg()，
+       若此前从未进过秘境/BOSS，_wolfInitImg 仍是 null，此时读到的必须是 HTML 内联的初始图。
+       放在此处显式取一次，避免将来有人改成动态替换时把「替换后的图」误当成初始图缓存。 */
+    if(typeof _wolfInitImg !== 'undefined' && _wolfInitImg === null){
+      const _wel = $('wolfImg');
+      if(_wel) _wolfInitImg = _wel.style.backgroundImage;
+    }
+    /* 顶层赋值：S 中已定义的字段照常恢复；S 定义中缺失的动态字段（如 achClaim/gongfa/pets）
+       由下方显式读回处理，此处不再因 hasOwnProperty 静默丢弃 */
+    for(const k in o) if(o[k] !== null && o[k] !== undefined && (S.hasOwnProperty(k) || DYN_KEYS.has(k))) S[k] = o[k];
+    /* 复杂对象显式读回（for-in 已覆盖，此处兜底确保对象引用正确） */
+    /* 对象字段显式读回：不依赖 S.hasOwnProperty，避免动态字段被跳过 */
+    ['plots','seeds','pills','pillUse','relics','relicAd','relicLv','qt',
+     'achClaim','gongfa','gongfaOff','pets','petsOff','meridian','bossCnt','talents','qp','gfUp','weapQ','seedKinds',
+     'shardL','shardS','shardT','weap','titles',
+     'lmgCave','lmgArti','frClone','pickOpen','mai'].forEach(function(k){   /* 已移除两个废弃键：无读取点的任务标记、从未使用的地块扩展字段 */
+      if(o[k] !== null && o[k] !== undefined && typeof o[k] === 'object') S[k] = o[k];
+    });
+    /* 兜底：仍为空则补空对象（旧档兼容） */
+    ['achClaim','gongfa','gongfaOff','pets','petsOff','meridian','bossCnt','pills','pillUse','gfUp','weapQ','seedKinds',
+     'relics','relicAd','relicLv','qt','qp','seeds','treasures','titles'].forEach(function(k){   /* 已移除已废弃的任务领取标记 */
+      if(!S[k] || typeof S[k] !== 'object') S[k] = {};
+    });
+    /* BOSS 奖励层数：确保为数字（旧档无此字段时补 0） */
+    ['boss_fatk','boss_patk','boss_rb','boss_cdm','boss_psn','boss_plc','boss_psnadd','boss_fdm','boss_neili'].forEach(function(k){
+      if(typeof S[k] !== 'number' || !isFinite(S[k]) || S[k] < 0) S[k] = 0;
+    });
+    /* 音效开关：显式读回（旧档无此字段则保持默认开启） */
+    if(o.snd_bgm !== undefined && o.snd_bgm !== null) S.snd_bgm = o.snd_bgm;   /* 读回音乐开关 */
+    if(S.hp && S.hp.m !== undefined) S.hp = D(S.hp.m, S.hp.e);
+    if(S.maxHp && S.maxHp.m !== undefined) S.maxHp = D(S.maxHp.m, S.maxHp.e);
+    if(S.secretHp && S.secretHp.m !== undefined) S.secretHp = D(S.secretHp.m, S.secretHp.e);
+    if(S.secretMaxHp && S.secretMaxHp.m !== undefined) S.secretMaxHp = D(S.secretMaxHp.m, S.secretMaxHp.e);
+    if(dcmp(S.hp, D(0)) <= 0) S.hp = S.maxHp;
+    if(dcmp(S.hp, S.maxHp) > 0) S.hp = S.maxHp;   /* 成长系数下调后，旧档残血可能超过新上限 */
+  if(!S.meridian || typeof S.meridian !== 'object') S.meridian = {};   /* 旧档补经脉字段 */
+  if(!S.achClaim || typeof S.achClaim !== 'object') S.achClaim = {};   /* 旧档补成就领取记录 */
+  if(!S.gongfa || typeof S.gongfa !== 'object') S.gongfa = {};         /* 旧档补功法字段 */
+  /* 1.56：gongfaOff / petsOff 已废除，此处不再初始化（下方统一清空为 {}） */
+  if(!S.pets || typeof S.pets !== 'object') S.pets = {};               /* 旧档补宠物字段 */
+  if(!S.bossCnt || typeof S.bossCnt !== 'object') S.bossCnt = {};      /* 旧档补 BOSS 挑战字段 */
+  /* 类型校验：上面只判了「是不是 object」，而数组也是 object ——
+     存档若被改成 {} 或子项被换成对象，tHas() 的 S.talents.indexOf(id)、bossCntArr 的 cnt[i] 会直接抛错，
+     连锁把 render() 带崩、界面彻底卡死。这里强制收敛成数组。 */
+  if(!Array.isArray(S.talents)) S.talents = [];
+  for(const _wk in S.bossCnt){ if(!Array.isArray(S.bossCnt[_wk])) S.bossCnt[_wk] = []; }
+  /* 界别同步必须早于血量恢复：若存档血量无效需 bossCurMaxHp() 重算，
+     用默认的 'fj' 会按错界别的通关次数取血量，导致血量与计数错位。 */
+  /* 界别统一由 bossWorld() 读取，无需再同步模块变量 */
+  if(S.inBoss){                                                        /* 恢复 BOSS 挑战进度 */
+    if(S.bossHp && S.bossHp.m !== undefined) S.bossHp = D(S.bossHp.m, S.bossHp.e);
+    if(S.bossMaxHp && S.bossMaxHp.m !== undefined) S.bossMaxHp = D(S.bossMaxHp.m, S.bossMaxHp.e);
+    if(!S.bossMaxHp || dcmp(S.bossMaxHp, D(0)) <= 0) S.bossMaxHp = bossCurMaxHp(S.bossIdx || 0);
+    if(!S.bossHp || dcmp(S.bossHp, D(0)) <= 0) S.bossHp = S.bossMaxHp;
+    if(dcmp(S.bossHp, S.bossMaxHp) > 0) S.bossHp = S.bossMaxHp;
+  }
+  /* 秘境为「临时模式」：读档时有意丢弃进度（层数/残血），不随会话恢复；
+     BOSS / 塔 则属于可续战模式，故下方保留其层数与残血。三者差异为有意设计，非遗漏。 */
+  if(S.inSecret){ S.inSecret=false; stopSecret(); S.secretHp=null; S.poison=0; }
+  if(S.towerHp && S.towerHp.m !== undefined) S.towerHp = D(S.towerHp.m, S.towerHp.e);
+  if(S.towerMaxHp && S.towerMaxHp.m !== undefined) S.towerMaxHp = D(S.towerMaxHp.m, S.towerMaxHp.e);
+  if(S.inTower){                                       /* 恢复塔内进度：层数 / 类型 / 残血 */
+    S.towerType = S.towerType || 'fr';
+    if(!S.towerFloor) S.towerFloor = (S.towerType==='sb') ? ((S.sbDone||0)+1) : ((S.towerDone||0)+1);
+    if(!S.towerMaxHp || dcmp(S.towerMaxHp, D(0)) <= 0) S.towerMaxHp = towerMaxHpFor(S.towerFloor, S.towerType);
+    if(!S.towerHp || dcmp(S.towerHp, D(0)) <= 0) S.towerHp = S.towerMaxHp;
+    if(dcmp(S.towerHp, S.towerMaxHp) > 0) S.towerHp = S.towerMaxHp;
+    S.poison = S.poison || 0;
+  } else {
+    S.towerType = S.towerType || 'fr';
+    S.towerHp = null; S.towerMaxHp = null;
+  }
+  /* 毒层不跨会话：主线/秘境读档一律从 0 开始，避免带着上次会话的百层毒对主线怪造成意外毒伤。
+     塔 / BOSS 属续战模式，其「未打完的那一层」保留毒层作为战斗进度；
+     击杀换层时由各自的 kill* 清零（与主线一致），故此处保留的只是当前层的叠毒进度。 */
+  if(!S.inTower && !S.inBoss) S.poison = 0;
+  S.towerDone = S.towerDone || 0;
+  S.sbDone = S.sbDone || 0; S.sbResetDay = S.sbResetDay || '';
+  S.realm = (S.realm === 'lmg') ? 'lmg' : 'fr';
+  S.lmgUnlocked = !!S.lmgUnlocked;
+  /* 三种灵界资源精度统一：灵石 / 抽奖券是普通 Number → 封顶 SAFE_INT；灵力已是大数 */
+  S.lmgStone  = Math.min(Math.max(0, Number(S.lmgStone)  || 0), SAFE_INT);
+  S.lmgTicket = Math.min(Math.max(0, Math.floor(Number(S.lmgTicket) || 0)), SAFE_INT);
+  S.lmgBossTicketMax = Math.max(0, Math.floor(Number(S.lmgBossTicketMax) || 0));
+  S.lmgArti = S.lmgArti || {equip:{}, bag:[], stone:0, seq:0};   /* 灵界法宝：装备位 / 背包 / 洗练石 */
+  /* 拾取过滤（1.42）：默认「全部保留」= -1；旧档缺字段按此补齐 */
+  if(typeof S.setArtiQ !== 'number' || !isFinite(S.setArtiQ)) S.setArtiQ = -1;
+  if(typeof S.setRuneQ !== 'number' || !isFinite(S.setRuneQ)) S.setRuneQ = -1;
+  S.lmgBossFrom = (S.lmgBossFrom === undefined) ? null : S.lmgBossFrom;   /* 旧版妖王挑战回退点（已由心魔试炼取代） */
+  S.lmgTrial = !!S.lmgTrial;                                   /* 心魔试炼：进行中标记 */
+  S.lmgTrialWin = Math.max(0, Math.floor(Number(S.lmgTrialWin) || 0));   /* 心魔试炼：成功次数（属性成长依据，无上限） */
+  S.lmgTrialFrom = (S.lmgTrialFrom === undefined) ? null : S.lmgTrialFrom;   /* 进入试炼前的主线层数 */
+  S.lmgMaxLv = Math.max(1, Math.floor(Number(S.lmgMaxLv) || (S.lmgLevel || 1)));   /* 历史最高关：选关范围 */
+  S.lmgAutoNext = (S.lmgAutoNext !== false);                   /* 灵界自动推关开关（默认开） */
+  S.lmgCave = S.lmgCave || {lv:{}, jade:0, acc:0};             /* 训练洞府：各产线等级 / 洞府灵玉 / 零头累计 */
+  S.frClone = S.frClone || {accGem:0, accNl:0, accBox:0, accSoul:0, total:{}};   /* 凡人界分身：零头累计 */
+  if(typeof S.cloneAutoNext !== 'boolean') S.cloneAutoNext = false;   /* 1.56 分身自动推关（默认关） */
+  if(typeof S.cloneAutoRb   !== 'boolean') S.cloneAutoRb   = false;   /* 1.56 分身自动转生（默认关） */
+  /* 幽冥魂殿：旧档无此字段时补空；等级必须在 0~SOUL_PACT_MAX 之间（改档写 9999 会被压回上限）。
+     与 lmgStone 同口径：不放进 SANE_MAX（那是普通数字字段的白名单），单独在 load 末尾收敛。 */
+  if(!S.soulPact || typeof S.soulPact !== 'object' || Array.isArray(S.soulPact)) S.soulPact = {};
+  for(const _sk in S.soulPact){
+    if(!soulPactDef(_sk)){ delete S.soulPact[_sk]; continue; }        /* 清掉不存在的魂契 key */
+    let _v = Math.floor(Number(S.soulPact[_sk]) || 0);
+    if(!isFinite(_v) || _v < 0) _v = 0;
+    if(_v > SOUL_PACT_MAX) _v = SOUL_PACT_MAX;
+    S.soulPact[_sk] = _v;
+  }
+  if(!S.soulBuy || typeof S.soulBuy !== 'object' || Array.isArray(S.soulBuy)) S.soulBuy = {};
+  for(const _bk in S.soulBuy){ const _n = Math.floor(Number(S.soulBuy[_bk]) || 0); S.soulBuy[_bk] = (isFinite(_n) && _n > 0) ? _n : 0; }
+  /* 旧档（字段被删 / 从未写过）显式归零：不能沿用运行时残留值，否则读旧档会凭空多出统计数 */
+  S.soulDraw = (typeof o.soulDraw === 'number' && isFinite(o.soulDraw)) ? Math.max(0, Math.floor(o.soulDraw)) : 0;
+  /* 灵界符文：结构收敛。
+     改档能造成的破坏：① bag 不是数组 → push/filter 直接抛错，连锁把 render 带崩；
+     ② 符文 item 的 k 不在 RUNE_KINDS 里 → runeKindDef 返回 null，runeItemVal 归零但不崩（可接受）；
+     ③ q / lv 越界 → 数组下标取到 undefined，加成变 NaN 并污染整条属性链；
+     ④ equip 指向不存在的 id → 槽位显示空但占位，玩家再也装不进去。这里全部收口。 */
+  {
+    /* 必须以「存档里有没有」为准，不能复用 S.lmgRune 的运行时残留：
+       load() 开头只把存档中存在的字段写回 S，旧档没有 lmgRune 时 S.lmgRune 仍是上一局的背包，
+       沿用它会让「读旧档」凭空继承一套不属于该档的符文（与 soulDraw 同类问题）。 */
+    const rd = (o.lmgRune && typeof o.lmgRune === 'object' && !Array.isArray(o.lmgRune)) ? o.lmgRune : null;
+    S.lmgRune = {
+      bag:   (rd && Array.isArray(rd.bag)) ? rd.bag : [],
+      equip: (rd && rd.equip && typeof rd.equip === 'object' && !Array.isArray(rd.equip)) ? rd.equip : {},
+      seq:   (rd && isFinite(Number(rd.seq))) ? Math.max(0, Math.floor(Number(rd.seq))) : 0,
+      /* 符文碎片（1.42）：旧档无此字段 → 0 */
+      shard: (rd && isFinite(Number(rd.shard))) ? Math.max(0, Math.floor(Number(rd.shard))) : 0
+    };
+    let maxId = 0;
+    S.lmgRune.bag = S.lmgRune.bag.filter(function(it){
+      if(!it || typeof it !== 'object') return false;
+      if(!runeKindDef(it.k)) return false;                                    /* 丢弃不存在的种类 */
+      it.q  = Math.max(0, Math.min(RUNE_Q.length - 1, Math.floor(Number(it.q) || 0)));
+      it.lv = Math.max(1, Math.min(RUNE_LV_MAX, Math.floor(Number(it.lv) || 1)));
+      it.feed = Math.max(0, Number(it.feed) || 0);
+      it.id = Math.floor(Number(it.id) || 0);
+      if(it.id <= 0) return false;                                            /* 无 id 的无法被 equip 引用 */
+      if(it.id > maxId) maxId = it.id;
+      return true;
+    });
+    /* seq 必须不小于现有最大 id，否则新生成的符文 id 与老的重号，equip 会指错对象 */
+    if(S.lmgRune.seq < maxId) S.lmgRune.seq = maxId;
+    /* equip：只保留「槽位在合法范围内 且 指向真实存在符文」的项；
+       同时保证同一种符文不会被塞进多个槽（否则单属性叠乘，破坏「同种只能镶 1 枚」的规则）。 */
+    const seen = {}, eq = {};
+    for(const s in S.lmgRune.equip){
+      const idx = parseInt(s, 10);
+      if(!isFinite(idx) || idx < 0 || idx >= RUNE_SLOTS.length) continue;
+      const it = runeById(S.lmgRune.equip[s]);
+      if(!it) continue;
+      if(seen[it.k]) continue;
+      seen[it.k] = 1; eq[idx] = it.id;
+    }
+    S.lmgRune.equip = eq;
+  }
+  /* 香火：余额（大数）+ 神位等级收敛。
+     改档能造成的破坏：① 余额为负 → 成本判定永远失败，面板变砖；
+     ② 神位等级越界 → 加成突破设计上限；③ 不存在的神位 key → 长期占位。全部收口。 */
+  S.incense = _toD((o.incense === undefined || o.incense === null) ? D(0) : o.incense);
+  if(dcmp(S.incense, D(0)) < 0) S.incense = D(0);
+  if(!S.incenseLv || typeof S.incenseLv !== 'object' || Array.isArray(S.incenseLv)) S.incenseLv = {};
+  for(const _ik in S.incenseLv){
+    if(!incenseDef(_ik)){ delete S.incenseLv[_ik]; continue; }
+    let _v = Math.floor(Number(S.incenseLv[_ik]) || 0);
+    if(!isFinite(_v) || _v < 0) _v = 0;
+    const _mx = incenseMaxLv(_ik);
+    if(_v > _mx) _v = _mx;
+    S.incenseLv[_ik] = _v;
+  }
+  S.incenseFirst = Math.max(0, Math.floor(Number(o.incenseFirst) || 0));
+  if(!isFinite(S.incenseFirst)) S.incenseFirst = 0;
+  /* 仙途纪事：只保留合法章节 key，其余丢弃。
+     改档塞进来的无效 key 会让 loreOwnN() 虚高，进而白送收集里程碑称号。 */
+  {
+    const _lo = (o.lore && typeof o.lore === 'object' && !Array.isArray(o.lore)) ? o.lore : {};
+    const _d = {};
+    for(let i = 0; i < LORE_CH.length; i++){ const _k = LORE_CH[i].k; if(_lo[_k]) _d[_k] = 1; }
+    S.lore = _d;
+  }
+  /* 不再赠送开局灵玉：第一条产线改为免费（见 caveUpCost），
+     零门槛起点由「免费首级」承担，不需要额外发钱，也避免新档凭空多一笔资源。 */
+  petLoad();
+  S.lmgPower = _toD(S.lmgPower || 0);                  /* 灵力已升级为大数（成本 1.35^lv 会突破双精度） */
+  /* 修真：旧档迁移。原「修炼 Lv」每级 +20%，已被修真（每小境 +30%）取代，
+     若不迁移，老玩家的灵属性加成会凭空消失 —— 这里按等价加成换算成修真进度。 */
+  if(typeof S.cultRealm !== 'number' || typeof S.cultSub !== 'number'){
+    if((S.lmgCultLv || 0) > 0){
+      const _p = cultFromTotal(Math.round((S.lmgCultLv || 0) * 20 / CULT_BONUS_PER));
+      S.cultRealm = _p.r; S.cultSub = _p.s;
+    } else { S.cultRealm = 0; S.cultSub = 0; }
+  }
+  S.cultRealm = Math.max(0, Math.min(CULT_REALMS.length - 1, S.cultRealm));
+  S.cultSub   = Math.max(0, S.cultSub);
+  /* 1.51：老档（数组）迁移为等级表 {id: lv}，原有天赋全部视作 Lv.1 */
+  if(Array.isArray(S.lmgTalents)){
+    const _o = {};
+    S.lmgTalents.forEach(function(id){ _o[id] = (_o[id] || 0) + 1; });
+    S.lmgTalents = _o;
+  }
+  S.lmgTalents = (S.lmgTalents && typeof S.lmgTalents === 'object') ? S.lmgTalents : {};
+  /* 1.55：功法 / 宠物取消停用与休息，旧档残留的 gongfaOff / petsOff 一律清除，已购者全部恢复生效 */
+  S.gongfaOff = {}; S.petsOff = {};
+  S.offTime = Math.min(offStoreCap(), Math.max(0, Number((o && o.offTime) || 0)));
+  S.onTime  = Math.min(Math.min(offStoreCap(), ON_STORE_CAP), Math.max(0, Number((o && o.onTime) || 0)));
+  /* 1.52 修复：灵脉存档恢复。兼容两种老档：
+     ① 1.52 之前的档根本没有 mai 字段 → 用旧的 o.ore / o.ly 兜底（当时只存了这两个）；
+     ② 有 mai 字段 → 整体恢复，再交给 maiData() 补齐缺失的子结构。 */
+  S.mai = (o && o.mai && typeof o.mai === 'object') ? o.mai
+        : { ore: Math.max(0, Math.floor((o && o.ore) || 0)), ly: Math.max(0, Math.floor((o && o.ly) || 0)) };
+  maiData();
+  S.pickOpen = (o && o.pickOpen && typeof o.pickOpen === 'object') ? o.pickOpen : {};   /* 1.52：拾取过滤折叠状态持久化 */
+  S.lmgAtkLv = S.lmgAtkLv || 0; S.lmgHpLv = S.lmgHpLv || 0; S.lmgDefLv = S.lmgDefLv || 0;
+  /* 灵界属性等级：老档用 lmgAtkLv/hpLv/defLv 三个独立字段，迁移到 S.lmgAttr 对象（13 项统一存储） */
+  /* 以存档为准：存档里没有 lmgAttr 字段（老档）时，先清掉内存残留，避免同会话二次 load 时旧值盖住迁移结果 */
+  if(typeof o !== 'undefined' && o && !o.lmgAttr) S.lmgAttr = {};
+  if(!S.lmgAttr || typeof S.lmgAttr !== 'object') S.lmgAttr = {};
+  /* 用 typeof 而非 !x：等级恰好为 0 时 !0 为真，会被旧字段错误覆盖 */
+  if(typeof S.lmgAttr.atk !== 'number') S.lmgAttr.atk = S.lmgAtkLv || 0;
+  /* 一律用 typeof 判断：原 hp/def 用 ! 判断，等级为合法的 0 时会被旧字段 lmgHpLv 错误覆盖 */
+  if(typeof S.lmgAttr.hp  !== 'number') S.lmgAttr.hp  = S.lmgHpLv  || 0;
+  if(typeof S.lmgAttr.def !== 'number') S.lmgAttr.def = S.lmgDefLv || 0;
+  LMG_ATTR.forEach(function(a){ if(typeof S.lmgAttr[a.k] !== 'number' || !isFinite(S.lmgAttr[a.k])) S.lmgAttr[a.k] = 0; });
+  /* 灵修攻速新增等级上限 100：老档若已升超，按升级成本全额退还灵力，避免玩家白花 */
+  lmgRefundSpdOverflow();
+  lmgRefundOverflow('combo');          /* 连击新增 Lv.100 上限：老档超出的按真实价格退灵力 */
+  /* 1.81：资源组新增 Lv.600 上限，老档超出的按真实价格退灵力（同上，不白花）。
+     不退款的话 lmgAttrLv() 会静默夹取，玩家此前投的灵力凭空蒸发。 */
+  ['gp','gs','gu'].forEach(function(_k){ lmgRefundOverflow(_k); });
+  S.lmgCultLv = S.lmgCultLv || 0; S.lmgLevel = S.lmgLevel || 1;
+  /* lmgHp 已升级为大数：旧档是 number，新档是 {m,e}；两者都接受，其它类型归 null */
+  if(S.lmgHp !== null && S.lmgHp !== undefined && typeof S.lmgHp !== 'number' && typeof S.lmgHp !== 'object') S.lmgHp = null;
+  if(S.lmgHp !== null && S.lmgHp !== undefined) S.lmgHp = _toD(S.lmgHp);
+  lmgHpMigrate();          /* 1.46：血量跨版本迁移（老档百万级 → 当前体系），必须与 lmgAttr 就绪后调用 */
+  S.lmgHpVer = LMG_HP_VER; S.lmgHpPct = lmgHpPct();   /* 迁移后立刻改写标记与百分比，避免重复迁移 */
+  S.frResetDay = S.frResetDay || '';                        /* 凡人塔每日重置：老档补空串，视为「今日未重置」 */
+  if(S.secResetSec === undefined) S.secResetSec = 30;       /* 1.56 秘境自动重置秒数，老档补默认 30 秒 */
+  if(S.arbSec === undefined) S.arbSec = 5;                  /* 1.56 自动转生检查间隔，老档补默认 5 秒 */
+  S.shardT = S.shardT || 0; S.shardL = S.shardL || 0; S.shardS = S.shardS || 0; S.weap = S.weap || {};
+  S.box = resD('box'); S.relicFrag = resD('relicFrag'); S.relics = S.relics || {};
+  S.qd = S.qd || ''; S.qp = S.qp || {};
+  S.farmLv = S.farmLv || 1; S.farmStage = S.farmStage || 0; S.farmOpen = S.farmOpen || 4;
+  S.plots = S.plots || []; S.seeds = S.seeds || []; S.pills = S.pills || {}; S.pillUse = S.pillUse || {};
+  /* 丹药大数规范化：旧档存的是 Number，统一转成大数；非法值（NaN / Infinity / 负数 / 坏对象）归零。
+     必须在读档时做完，否则 S.pills[k] 混着 number 与 {m,e} 两种形态 ——
+     各处 dcmp / dadd 虽能容错，但签名摘要会随形态漂移，dStr 显示口径也不统一。
+     顺带挡住改档写 S.pills = {x: 1e309} 这类污染（1e309 的 Number 是 Infinity，会被归零）。 */
+  (function(){
+    const bigOk = function(v){
+      return !!(v && typeof v === 'object' && v.m !== undefined &&
+                isFinite(Number(v.m)) && isFinite(Number(v.e)) && Number(v.m) >= 0);
+    };
+    for(const k in S.pills){
+      const v = S.pills[k];
+      if(typeof v === 'number') S.pills[k] = (isFinite(v) && v > 0) ? D(v) : D(0);
+      else if(bigOk(v)) S.pills[k] = _toD(v);
+      else S.pills[k] = D(0);
+    }
+    delete S.pill;                                        /* 进阶丹已废弃，清除旧档残留 */
+  })();
+  farmInit();
+  S.relicAd = S.relicAd || {};
+  ['stAtkD','stPsnD','stCrtD'].forEach(function(k){ if(S[k] && S[k].m !== undefined) S[k] = D(S[k].m, S[k].e); });
+  S.totalDmg = (S.totalDmg && S.totalDmg.m !== undefined) ? D(S.totalDmg.m, S.totalDmg.e) : D(Number(S.totalDmg) || 0);
+  S.stPlant = S.stPlant || 0; S.stFrF = S.stFrF || 0; S.stSbF = S.stSbF || 0;
+  S.stSecK = S.stSecK || 0; S.stLv = S.stLv || 0; S.stBox = S.stBox || 0;
+  S.boxPity = S.boxPity || 0; S.stRare = S.stRare || 0;   /* 凡尘宝箱稀有掉落：连开计数 / 累计出货数 */
+  S.gfLv = S.gfLv || {}; S.petLv = S.petLv || {}; S.treLv = S.treLv || {};   /* 重复掉落重数（每重 +50%，特殊属性不涨） */
+  S.fert = S.fert || {};                                                     /* 1.56 化肥（背包·辅助类） */
+  S.stHarvest = S.stHarvest || 0; S.titles = S.titles || {}; if(typeof titleBump === 'function') titleBump();
+  S.soulAcc = (typeof S.soulAcc === 'number' && isFinite(S.soulAcc)) ? S.soulAcc : 0;
+  /* 2.23：灵魂正式改为大数存储，此处只做形态收敛（旧档的数字 / 已污染的大数对象统一转成 {m,e}），
+     不再夹到 SAFE_INT —— 那只是精度天花板，不是设计上限。 */
+  S.soul = resD('soul');
+  S.pts = (S.pts && S.pts.m !== undefined) ? D(S.pts.m, S.pts.e) : D(Number(S.pts) || 0);
+  S.gem = resD('gem'); S.tstone = resD('tstone');   /* 2.23：资源统一收敛为大数形态 */
+  initAudio(); playBgm();   /* 尝试播放（被拦截则等首次交互解锁） */
+  if(S._warn === 'tampered'){                 /* 回滚到上次正常值，绝不清除存档 */
+    setTimeout(function(){ toast('存档数值异常，已自动还原'); }, 1200);
+    S._warn = null;
+  }
+  }catch(e){}
+}
+load();
+checkOffline();                        /* 离线：凡人界只收集时间，灵界 / 洞府照旧 */
+startOnTimeTick();                     /* 1.54：在线时间累积（每 60 秒 +1/60 小时） */
+startCaveTick();                       /* 洞府在线产出：每 5 分钟结算 */
+startFrCloneTick();                    /* 凡人界分身：仅在灵界时产出，每 5 分钟结算，无离线 */
+startClonePushTick();                  /* 1.56：分身平滑推关（每秒），关卡数字持续上涨 */
+
+/* 顺序已无依赖：敌人区图片统一由 syncEnemyVisual() 按
+   S.inBoss > S.inSecret > S.inTower 优先级决定，每个 apply*UI() 末尾都会调用它，
+   谁先谁后结果一致（此前「主线怪物被狼图覆盖」正是「无条件显示 + 依赖调用顺序」造成的）。 */
+/* DEV 悬浮按钮：原实现只在 renderSettings() 里才显示 —— 必须先打开一次「设置」面板，
+   DEV 按钮才会出现，测试时极易误判为「这版没有开发者模式」。改为启动即按 DEV_MODE 决定。 */
+if(DEV_MODE){ const _df0 = $('devFab'); if(_df0) _df0.style.display = 'block'; }
+buildAttrList();
+applySecretUI();
+applyTowerUI();
+applyBossUI();
+renderBossMode();
+render();
+if(!pvStartPending) startAuto();   /* 未同意隐私政策时挂起战斗循环，避免遮罩后空跑 */
+saveTimer = setInterval(save, 5000);
+/* 称号巡检：每 3 秒检查一次达成情况，达成即自动获得并立即被动生效 */
+checkTitles(true);
+loreCheck(true);                     /* 启动时静默补签：老档可能一次性达成大量章节，只写日志不弹窗 */
+titleRed();
+setInterval(function(){ checkTitles(); }, 3000);
+/* 已移除 window.addEventListener('visibilitychange', save)：
+   visibilitychange 只在 document 上派发，挂到 window 上永远收不到，是无效监听；
+   且 wipeSave() 只移除 document 上的具名监听，这条会残留下来。
+   切后台存档统一由 document 上的 _onVisChange 负责（save + 回来后结算离线）。 */
+
+</script>
+</div>
+</body>
+</html>
